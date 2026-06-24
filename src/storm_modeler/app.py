@@ -218,7 +218,7 @@ def _build_window(persist: bool):
             self.volumes.set_warning(warning)
             self.map.show_warning(warning)
 
-            log.info("download.start", warning=warning.id, event=warning.event,
+            log.info("download.start", warning=warning.id, event_name=warning.event,
                      site=site.icao, issued=warning.issued.isoformat(),
                      expires=warning.expires.isoformat())
             cancel = threading.Event()
