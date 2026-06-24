@@ -255,7 +255,27 @@ def _build_window(persist: bool):
     return MainWindow()
 
 
+def _reconcile_gui_platform() -> None:
+    """Make Qt and VTK agree on a windowing system before the GUI starts.
+
+    VTK renders through X11 whenever ``DISPLAY`` is set. On a Wayland session Qt
+    defaults to the ``wayland`` platform, so the embedded VTK GL widgets (which
+    drive X windows on Xwayland) cannot attach to the Wayland Qt window and the
+    app aborts with BadWindow. When we detect that mismatch — a Wayland session
+    with an Xwayland ``DISPLAY`` and no explicit override — pin Qt to ``xcb`` so
+    both use the same X server. Honoured only if the user has not chosen a
+    platform themselves.
+    """
+    if os.environ.get("QT_QPA_PLATFORM"):
+        return
+    if os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY"):
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
+        log.info("gui.platform_pinned", platform="xcb",
+                 reason="wayland session with X11-only VTK")
+
+
 def run_gui(args: argparse.Namespace) -> int:
+    _reconcile_gui_platform()
     from PySide6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication(sys.argv)
