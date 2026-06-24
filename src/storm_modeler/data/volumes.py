@@ -21,7 +21,7 @@ from typing import Iterator
 
 import structlog
 
-from ..config import DEFAULT_GRID, POST_MINUTES, PRE_MINUTES, GridConfig
+from ..config import DEFAULT_GRID, GridConfig
 from ..models import GriddedVolume
 
 log = structlog.get_logger(__name__)
@@ -38,11 +38,13 @@ class VolumeSource(ABC):
         return self.volumes()
 
 
-def bounded_window(issued: datetime, expires: datetime) -> tuple[datetime, datetime]:
+def bounded_window(
+    issued: datetime, expires: datetime, pre_minutes: int = 60, post_minutes: int = 30
+) -> tuple[datetime, datetime]:
     """The deterministic pull window for a warning (Section 2)."""
     return (
-        issued - timedelta(minutes=PRE_MINUTES),
-        expires + timedelta(minutes=POST_MINUTES),
+        issued - timedelta(minutes=pre_minutes),
+        expires + timedelta(minutes=post_minutes),
     )
 
 
@@ -60,6 +62,8 @@ class NexradArchiveSource(VolumeSource):
         lat0: float,
         lon0: float,
         grid: GridConfig = DEFAULT_GRID,
+        h_km: float = 1.0,
+        v_km: float = 0.5,
     ) -> None:
         self.site = site
         self.start = start.astimezone(timezone.utc)
@@ -67,6 +71,8 @@ class NexradArchiveSource(VolumeSource):
         self.lat0 = lat0
         self.lon0 = lon0
         self.grid = grid
+        self.h_km = h_km
+        self.v_km = v_km
 
     def _list_keys(self) -> list[str]:
         """List archive object keys in the window (lazy s3fs)."""
@@ -113,7 +119,8 @@ class NexradArchiveSource(VolumeSource):
             log.info("nexrad.read", key=key, valid_time=t.isoformat())
             with fs.open(key, "rb") as fh:
                 vol = grid_level2(
-                    fh, self.site, self.lat0, self.lon0, self.grid
+                    fh, self.site, self.lat0, self.lon0, self.grid,
+                    self.h_km, self.v_km,
                 )
             yield vol
 
@@ -124,6 +131,8 @@ def grid_level2(
     lat0: float,
     lon0: float,
     grid: GridConfig = DEFAULT_GRID,
+    h_km: float = 1.0,
+    v_km: float = 0.5,
 ) -> GriddedVolume:
     """Grid one archived Level II volume onto the local Cartesian grid.
 
@@ -137,7 +146,7 @@ def grid_level2(
     radar = pyart.io.read_nexrad_archive(file_obj)
 
     hw = grid.half_width_km * 1000.0
-    nz, ny, nx = grid.nz(), grid.nx(), grid.nx()
+    nz, ny, nx = grid.nz(v_km), grid.nx(h_km), grid.nx(h_km)
     z_lim = (grid.z_min_km * 1000.0, grid.z_max_km * 1000.0)
 
     gridded = pyart.map.grid_from_radars(

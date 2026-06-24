@@ -22,18 +22,18 @@ from pyproj import Transformer
 from ..config import DEFAULT_GRID, GridConfig
 from ..models import GriddedVolume
 
+# Default fixture grid spacing (km). Matches the registry grid_h_km / grid_v_km
+# defaults; kept here so synthetic volumes need no settings store.
+H_KM = 1.0
+V_KM = 0.5
 
-def _axes(grid: GridConfig):
+
+def _axes(grid: GridConfig, h_km: float = H_KM, v_km: float = V_KM):
     hw = grid.half_width_km * 1000.0
-    sp = grid.horizontal_spacing_km * 1000.0
+    sp = h_km * 1000.0
     x = np.arange(-hw, hw + sp / 2, sp, dtype=np.float64)
     y = np.arange(-hw, hw + sp / 2, sp, dtype=np.float64)
-    z = (
-        np.arange(
-            grid.z_min_km, grid.z_max_km + grid.z_spacing_km / 2, grid.z_spacing_km
-        )
-        * 1000.0
-    )
+    z = np.arange(grid.z_min_km, grid.z_max_km + v_km / 2, v_km) * 1000.0
     return x, y, z
 
 
