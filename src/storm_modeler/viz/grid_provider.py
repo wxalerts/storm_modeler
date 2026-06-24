@@ -17,6 +17,7 @@ worker and hands the resulting actors back to the GUI thread (Section 7).
 
 from __future__ import annotations
 
+import threading
 from collections import OrderedDict
 from datetime import datetime
 from typing import Callable, Iterable
@@ -50,18 +51,21 @@ class GridProvider:
         self.cache_size = max(1, int(cache_size))
         self._cache: "OrderedDict[str, GriddedVolume]" = OrderedDict()
         self._times: list[datetime] = []  # known order, oldest -> newest
+        # Scrubbing fetches grids on QThreadPool workers; guard the cache.
+        self._lock = threading.RLock()
 
     # --- registration / index --------------------------------------------
 
     def register(self, volume: GriddedVolume) -> None:
         """Cache an already-gridded volume (most-recently-used)."""
-        k = _key(volume.valid_time)
-        self._cache[k] = volume
-        self._cache.move_to_end(k)
-        if volume.valid_time not in self._times:
-            self._times.append(volume.valid_time)
-            self._times.sort()
-        self._evict()
+        with self._lock:
+            k = _key(volume.valid_time)
+            self._cache[k] = volume
+            self._cache.move_to_end(k)
+            if volume.valid_time not in self._times:
+                self._times.append(volume.valid_time)
+                self._times.sort()
+            self._evict()
 
     def register_all(self, volumes: Iterable[GriddedVolume]) -> None:
         for v in volumes:
@@ -86,10 +90,11 @@ class GridProvider:
     def get(self, valid_time: datetime) -> GriddedVolume:
         """Return the grid for ``valid_time`` (cache, else re-grid via factory)."""
         k = _key(valid_time)
-        hit = self._cache.get(k)
-        if hit is not None:
-            self._cache.move_to_end(k)
-            return hit
+        with self._lock:
+            hit = self._cache.get(k)
+            if hit is not None:
+                self._cache.move_to_end(k)
+                return hit
         if self.source_factory is None:
             raise KeyError(f"no grid cached for {k} and no source factory")
         log.info("grid_provider.regrid", valid_time=k)
