@@ -1,0 +1,137 @@
+"""Deterministic synthetic gridded volumes.
+
+Used to build the offline replay fixtures and unit tests. Everything here is a
+closed-form function of its arguments — no RNG, no clock — so a given call
+always yields byte-identical grids, preserving the determinism mandate.
+
+Two builders matter:
+
+* :func:`make_storm_volume` — a vertically deep convective core that SCIT must
+  admit (high reflectivity from the surface up to ~10 km).
+* :func:`make_ap_volume` — anomalous propagation: strong returns confined to
+  the lowest grid level, which SCIT must reject (zero admitted cells).
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+import numpy as np
+from pyproj import Transformer
+
+from ..config import DEFAULT_GRID, GridConfig
+from ..models import GriddedVolume
+
+
+def _axes(grid: GridConfig):
+    hw = grid.half_width_km * 1000.0
+    sp = grid.horizontal_spacing_km * 1000.0
+    x = np.arange(-hw, hw + sp / 2, sp, dtype=np.float64)
+    y = np.arange(-hw, hw + sp / 2, sp, dtype=np.float64)
+    z = (
+        np.arange(
+            grid.z_min_km, grid.z_max_km + grid.z_spacing_km / 2, grid.z_spacing_km
+        )
+        * 1000.0
+    )
+    return x, y, z
+
+
+def _lonlat_to_xy(lat0: float, lon0: float, lon: float, lat: float):
+    aeqd = (
+        f"+proj=aeqd +lat_0={lat0} +lon_0={lon0} +x_0=0 +y_0=0 "
+        "+datum=WGS84 +units=m +no_defs"
+    )
+    t = Transformer.from_crs("EPSG:4326", aeqd, always_xy=True)
+    return t.transform(lon, lat)
+
+
+def make_storm_volume(
+    site: str,
+    lat0: float,
+    lon0: float,
+    valid_time: datetime | str,
+    core_lon: float,
+    core_lat: float,
+    peak_dbz: float = 57.0,
+    echo_top_km: float = 10.5,
+    radius_km: float = 8.0,
+    grid: GridConfig = DEFAULT_GRID,
+) -> GriddedVolume:
+    """A single deep convective storm centred at ``(core_lon, core_lat)``.
+
+    The reflectivity declines with horizontal distance (Gaussian, scale
+    ``radius_km``) and with height (linear from a low-level peak down to 0 dBZ
+    near ``echo_top_km``), so the >=18.3 dBZ echo reaches ~``echo_top_km`` and
+    the >=40 dBZ core spans many levels — a textbook admit.
+    """
+    x, y, z = _axes(grid)
+    cx, cy = _lonlat_to_xy(lat0, lon0, core_lon, core_lat)
+
+    xx, yy = np.meshgrid(x, y)  # (ny, nx)
+    dist = np.hypot(xx - cx, yy - cy) / 1000.0  # km
+    horiz = np.exp(-(dist / radius_km) ** 2)  # (ny, nx) in [0,1]
+
+    z_km = z / 1000.0
+    peak_z = 1.5  # km, height of the reflectivity peak
+    echo_top_dbz = 18.3  # the contour that defines echo top
+    # Decline so the 18.3 dBZ contour reaches exactly ``echo_top_km``.
+    slope = (peak_dbz - echo_top_dbz) / (echo_top_km - peak_z)
+    prof = np.where(
+        z_km <= peak_z,
+        peak_dbz - 2.0 * (peak_z - z_km),  # mild surface taper
+        peak_dbz - slope * (z_km - peak_z),
+    )
+    prof = np.clip(prof, 0.0, None)  # (nz,)
+
+    refl = prof[:, None, None] * horiz[None, :, :]  # (nz, ny, nx)
+    refl = np.where(refl >= 5.0, refl, np.nan).astype(np.float32)
+    return GriddedVolume(
+        site=site,
+        valid_time=valid_time,
+        reflectivity=refl,
+        x=x,
+        y=y,
+        z=z,
+        lat0=lat0,
+        lon0=lon0,
+    )
+
+
+def make_ap_volume(
+    site: str,
+    lat0: float,
+    lon0: float,
+    valid_time: datetime | str,
+    core_lon: float,
+    core_lat: float,
+    peak_dbz: float = 52.0,
+    radius_km: float = 12.0,
+    grid: GridConfig = DEFAULT_GRID,
+) -> GriddedVolume:
+    """Anomalous propagation: strong returns ONLY at the lowest grid level.
+
+    No vertical structure whatsoever — the echo never appears above ``z[0]``.
+    SCIT's vertical-continuity gates (min levels / depth / echo top) reject it,
+    so it admits zero cells. This is the AP false-seed audit case.
+    """
+    x, y, z = _axes(grid)
+    cx, cy = _lonlat_to_xy(lat0, lon0, core_lon, core_lat)
+
+    xx, yy = np.meshgrid(x, y)
+    dist = np.hypot(xx - cx, yy - cy) / 1000.0
+    horiz = np.exp(-(dist / radius_km) ** 2)
+    ground = (peak_dbz * horiz).astype(np.float32)
+
+    refl = np.full((z.size, y.size, x.size), np.nan, dtype=np.float32)
+    refl[0] = np.where(ground >= 5.0, ground, np.nan)
+    return GriddedVolume(
+        site=site,
+        valid_time=valid_time,
+        reflectivity=refl,
+        x=x,
+        y=y,
+        z=z,
+        lat0=lat0,
+        lon0=lon0,
+    )
