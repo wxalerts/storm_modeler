@@ -38,6 +38,10 @@ class VolumeSource(ABC):
     def __iter__(self) -> Iterator[GriddedVolume]:
         return self.volumes()
 
+    def estimated_count(self) -> int:
+        """Cheap count of volumes in the window for progress (0 if unknown)."""
+        return 0
+
 
 def bounded_window(
     issued: datetime, expires: datetime, pre_minutes: int = 60, post_minutes: int = 30
@@ -221,6 +225,7 @@ class ThreddsLevel2Source(VolumeSource):
         self.grid = grid
         self.h_km = h_km
         self.v_km = v_km
+        self._keys: list[tuple[datetime, str]] | None = None
 
     @staticmethod
     def _name_time(name: str) -> datetime | None:
@@ -261,12 +266,20 @@ class ThreddsLevel2Source(VolumeSource):
         out.sort(key=lambda p: p[0])
         return out
 
+    def _keys_cached(self) -> list[tuple[datetime, str]]:
+        if self._keys is None:
+            self._keys = self._list_keys()
+        return self._keys
+
+    def estimated_count(self) -> int:
+        return len(self._keys_cached())
+
     def volumes(self) -> Iterator[GriddedVolume]:
         import io
 
         import httpx  # type: ignore
 
-        keys = self._list_keys()
+        keys = self._keys_cached()
         log.info("thredds.window", site=self.site, n=len(keys),
                  start=self.start.isoformat(), end=self.end.isoformat())
         with httpx.Client(timeout=180, follow_redirects=True) as client:
@@ -287,6 +300,9 @@ class FixtureVolumeSource(VolumeSource):
 
     def __init__(self, fixture_dir: str | Path) -> None:
         self.volumes_dir = Path(fixture_dir) / "volumes"
+
+    def estimated_count(self) -> int:
+        return len(list(self.volumes_dir.glob("*.npz")))
 
     def volumes(self) -> Iterator[GriddedVolume]:
         files = sorted(self.volumes_dir.glob("*.npz"))
