@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from storm_modeler.config import ScitConfig
+from storm_modeler.settings.resolver import DetectionParams
 from storm_modeler.data.sites import get_site
 from storm_modeler.data.synthetic import make_ap_volume, make_storm_volume
 from storm_modeler.detection import detection_v2 as scit
@@ -27,8 +27,8 @@ def test_storm_admits_one_deep_cell():
     assert c.max_dbz > 50
     assert c.depth_km > 6.0
     assert c.echo_top_km > 6.0
-    assert c.n_levels >= ScitConfig().min_levels
-    assert c.area_km2 >= ScitConfig().min_area_km2
+    assert c.n_levels >= DetectionParams().continuity_levels
+    assert c.area_km2 >= DetectionParams().min_area_km2
     assert c.envelope.is_valid and c.envelope.area > 0
 
 

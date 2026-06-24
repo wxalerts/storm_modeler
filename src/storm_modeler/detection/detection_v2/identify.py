@@ -1,20 +1,24 @@
-"""SCIT identification — gridded volume in, storm cells out.
+"""SCIT identification — gridded volume + params in, storm cells out.
 
-Phase-1 guarantee (carried from the SCIT spec): anomalous propagation never
-seeds. A seed candidate is admitted only when it shows genuine vertical
-structure — presence across several grid levels, a minimum echo depth, and a
-minimum echo top. Ground clutter (high reflectivity confined to the lowest
-level) fails every one of those gates and is dropped.
+Pure and testable: takes an explicit :class:`DetectionParams`, reads no globals.
+
+Phase-1 guarantee: anomalous propagation never seeds. A seed candidate is
+admitted only when it shows genuine vertical structure — presence across
+``continuity_levels`` grid levels and an echo top above ``echo_top_min_km``,
+measured against the ``continuity_dbz`` contour. Ground clutter (high
+reflectivity confined to the lowest level) fails both gates.
 """
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 from scipy import ndimage
 from shapely.geometry import MultiPoint, Polygon
 
-from ...config import ScitConfig
 from ...models import GriddedVolume
+from ...settings.resolver import DetectionParams
 from .types import StormCell
 
 
@@ -27,92 +31,114 @@ def _footprint_polygon(volume: GriddedVolume, ys: np.ndarray, xs: np.ndarray) ->
     hull = MultiPoint(pts).convex_hull
     if isinstance(hull, Polygon):
         return hull
-    # Degenerate (collinear / single point): give it a small footprint so it
-    # still renders and persists as a polygon.
     return hull.buffer(0.01)
 
 
-def identify(volume: GriddedVolume, config: ScitConfig | None = None) -> list[StormCell]:
+def _suppress_close_seeds(cells: list[StormCell], min_sep_km: float) -> list[StormCell]:
+    """Drop weaker cells whose centroid is within ``min_sep_km`` of a stronger one."""
+    if min_sep_km <= 0:
+        return cells
+    kept: list[StormCell] = []
+    # cells arrive strongest-first; greedily keep, suppressing close weaker ones.
+    for c in cells:
+        too_close = False
+        for k in kept:
+            d = math.hypot(c.seed_x - k.seed_x, c.seed_y - k.seed_y) / 1000.0
+            if d < min_sep_km:
+                too_close = True
+                break
+        if not too_close:
+            kept.append(c)
+    return kept
+
+
+def identify(volume: GriddedVolume, params: DetectionParams | None = None) -> list[StormCell]:
     """Identify admitted storm cells in a single gridded volume.
 
-    Deterministic: the same volume always yields the same cells in the same
-    order (sorted by descending peak reflectivity, then footprint area).
+    Deterministic: the same (volume, params) always yields the same cells in
+    the same order (sorted by descending peak reflectivity, then footprint).
     """
-    config = config or ScitConfig()
+    params = params or DetectionParams()
     refl = volume.reflectivity  # (nz, ny, nx)
     nz, ny, nx = refl.shape
-    dz_km = volume.dz_km or 0.5
+    dz_km = volume.dz_km or params.grid_v_km
     cell_area_km2 = volume.dx_km * volume.dx_km
 
-    seed_mask = np.nan_to_num(refl, nan=-9999.0) >= config.seed_dbz
+    filled = np.nan_to_num(refl, nan=-9999.0)
+    seed_mask = filled >= params.seed_dbz
     if not seed_mask.any():
         return []
 
-    # 6-connected 3D labelling: avoid diagonal bridging of distinct cells.
-    structure = ndimage.generate_binary_structure(3, 1)
+    base_mask2d = (filled >= params.base_dbz).any(axis=0)  # (ny, nx) footprint extent
+    top_mask = filled >= params.continuity_dbz  # echo-top / continuity contour
+
+    structure = ndimage.generate_binary_structure(3, 1)  # 6-connected
     labels, n = ndimage.label(seed_mask, structure=structure)
 
-    # Echo-top mask spans the whole column (captures anvil above the core).
-    top_mask = np.nan_to_num(refl, nan=-9999.0) >= config.echo_top_dbz
+    # Optional watershed split of merged seed blobs by per-column peak markers.
+    if params.watershed_split and n >= 1:
+        labels, n = _watershed_split(filled, seed_mask, labels)
+
+    # Connected-component labels of the base footprint, to grow each seed to its
+    # base extent.
+    base_labels, _ = ndimage.label(base_mask2d)
 
     candidates: list[StormCell] = []
     for lab in range(1, n + 1):
         region = labels == lab
-        zc, yc, xc = np.nonzero(region)
-        level_set = np.unique(zc)
-        n_levels = int(level_set.size)
+        zc, _, _ = np.nonzero(region)
+        n_levels = int(np.unique(zc).size)
 
-        # Footprint columns (any seed voxel in the column).
-        foot = region.any(axis=0)  # (ny, nx)
+        seed_foot = region.any(axis=0)  # (ny, nx)
+        # Grow to the base-reflectivity footprint that contains this seed.
+        overlap = base_labels[seed_foot]
+        overlap = overlap[overlap > 0]
+        if overlap.size:
+            base_id = np.bincount(overlap).argmax()
+            foot = base_labels == base_id
+        else:
+            foot = seed_foot
+
         ys_foot, xs_foot = np.nonzero(foot)
         area_km2 = float(ys_foot.size) * cell_area_km2
 
-        # Echo top / base from the broader echo-top mask over the footprint.
-        col_top = top_mask[:, foot]  # (nz, n_footprint)
+        col_top = top_mask[:, foot]
         z_present = np.nonzero(col_top.any(axis=1))[0]
         if z_present.size == 0:
             continue
-        k_top = int(z_present.max())
-        k_base = int(z_present.min())
+        k_top, k_base = int(z_present.max()), int(z_present.min())
         echo_top_km = float(volume.z[k_top]) / 1000.0
         base_km = float(volume.z[k_base]) / 1000.0
         depth_km = (float(volume.z[k_top]) - float(volume.z[k_base])) / 1000.0 + dz_km
 
         max_dbz = float(np.nanmax(refl[region]))
 
-        # Reflectivity-weighted footprint centroid (composite column max).
-        # Use -inf outside the region so empty columns never trip an
-        # all-NaN max; footprint columns always hold >=1 finite voxel.
         comp = np.where(region, np.nan_to_num(refl, nan=-np.inf), -np.inf).max(axis=0)
-        w = comp[foot]
+        w = comp[seed_foot]
         w = np.clip(np.where(np.isfinite(w), w, 0.0), 0.0, None)
+        ys_seed, xs_seed = np.nonzero(seed_foot)
         if w.sum() <= 0:
             w = np.ones_like(w)
-        seed_x = float(np.average(volume.x[xs_foot], weights=w))
-        seed_y = float(np.average(volume.y[ys_foot], weights=w))
+        seed_x = float(np.average(volume.x[xs_seed], weights=w))
+        seed_y = float(np.average(volume.y[ys_seed], weights=w))
         seed_lon, seed_lat = volume.xy_to_lonlat(np.array([seed_x]), np.array([seed_y]))
-        seed_lon = float(np.atleast_1d(seed_lon)[0])
-        seed_lat = float(np.atleast_1d(seed_lat)[0])
 
-        # --- Admission gates: this is what rejects AP --------------------
+        # --- Admission gates: what rejects AP -----------------------------
         admitted = (
-            n_levels >= config.min_levels
-            and depth_km >= config.min_depth_km
-            and echo_top_km >= config.min_echo_top_km
-            and area_km2 >= config.min_area_km2
+            n_levels >= params.continuity_levels
+            and echo_top_km >= params.echo_top_min_km
+            and area_km2 >= params.min_area_km2
         )
         if not admitted:
             continue
 
-        envelope = _footprint_polygon(volume, ys_foot, xs_foot)
-
         candidates.append(
             StormCell(
-                cell_id=-1,  # assigned after sorting
+                cell_id=-1,
                 site=volume.site,
                 valid_time=volume.valid_time,
-                seed_lon=seed_lon,
-                seed_lat=seed_lat,
+                seed_lon=float(np.atleast_1d(seed_lon)[0]),
+                seed_lat=float(np.atleast_1d(seed_lat)[0]),
                 seed_x=seed_x,
                 seed_y=seed_y,
                 max_dbz=max_dbz,
@@ -121,12 +147,31 @@ def identify(volume: GriddedVolume, config: ScitConfig | None = None) -> list[St
                 base_km=base_km,
                 depth_km=depth_km,
                 n_levels=n_levels,
-                envelope=envelope,
+                envelope=_footprint_polygon(volume, ys_foot, xs_foot),
             )
         )
 
-    # Deterministic ordering and ids.
     candidates.sort(key=lambda c: (-c.max_dbz, -c.area_km2, c.seed_x, c.seed_y))
+    candidates = _suppress_close_seeds(candidates, params.seed_min_separation_km)
     for i, c in enumerate(candidates):
         c.cell_id = i + 1
     return candidates
+
+
+def _watershed_split(filled: np.ndarray, seed_mask: np.ndarray, labels: np.ndarray):
+    """Split merged seed components at reflectivity saddles (skimage watershed)."""
+    from scipy import ndimage as ndi
+    from skimage.feature import peak_local_max
+    from skimage.segmentation import watershed
+
+    # Markers: local reflectivity maxima within the seed mask.
+    coords = peak_local_max(
+        np.where(seed_mask, filled, 0.0), min_distance=3, labels=labels
+    )
+    if coords.shape[0] == 0:
+        return labels, int(labels.max())
+    markers = np.zeros_like(labels)
+    for i, (z, y, x) in enumerate(coords, 1):
+        markers[z, y, x] = i
+    split = watershed(-filled, markers=markers, mask=seed_mask)
+    return split, int(split.max())
