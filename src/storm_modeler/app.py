@@ -221,6 +221,10 @@ def _build_window(persist: bool):
             log.info("download.start", warning=warning.id, event_name=warning.event,
                      site=site.icao, issued=warning.issued.isoformat(),
                      expires=warning.expires.isoformat())
+            # Ensure the Py-ART/cartopy/pyproj stack is imported on THIS (main)
+            # thread before the worker grids — importing it on the worker
+            # segfaults in pyproj's non-thread-safe CRS init.
+            warmup_grid_stack()
             cancel = threading.Event()
             dialog = DownloadDialog(f"{site.icao}  {warning.event}", parent=self)
             worker = WarningWorker(warning, factory(), site, self.params, self.dsn, cancel)
@@ -296,13 +300,41 @@ def _reconcile_gui_platform() -> None:
                  reason="wayland session with X11-only VTK")
 
 
+_GRID_STACK_READY = False
+
+
+def warmup_grid_stack() -> bool:
+    """Import the Py-ART gridding stack on the *calling* thread (idempotent).
+
+    Py-ART pulls in cartopy, whose module-level CRS construction calls pyproj —
+    and pyproj/PROJ context initialisation is NOT thread-safe. Importing it
+    lazily on a ``QThreadPool`` worker (the first grid_level2 call) segfaults, so
+    we force the import onto the main thread up front. Safe to call repeatedly;
+    after the first success Python's module cache makes it a no-op.
+    """
+    global _GRID_STACK_READY
+    if _GRID_STACK_READY:
+        return True
+    try:
+        import pyart  # noqa: F401 - imported for its side-effecting CRS init
+        _GRID_STACK_READY = True
+        log.info("warmup.grid_stack_ready")
+    except Exception as e:  # noqa: BLE001 - live extra may be absent
+        log.info("warmup.grid_stack_skipped", reason=str(e).splitlines()[0])
+    return _GRID_STACK_READY
+
+
 def run_gui(args: argparse.Namespace) -> int:
     _reconcile_gui_platform()
+    from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication(sys.argv)
     window = _build_window(persist=args.persist)
     window.show()
+    # Warm the gridding stack on the main thread shortly after the window paints
+    # (see warmup_grid_stack) so the first Download never imports it on a worker.
+    QTimer.singleShot(200, warmup_grid_stack)
     if args.replay:
         window.load_fixtures()
     elif args.from_ and args.to:
