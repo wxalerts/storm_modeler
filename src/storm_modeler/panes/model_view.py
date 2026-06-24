@@ -333,6 +333,8 @@ class ModelPane(QWidget):
 
     def _build_3d(self, volume, cell: StormCell, cells: list[StormCell],
                   reset_cam: bool) -> None:
+        log.info("model.build_3d.begin", valid_time=volume.valid_time.isoformat(),
+                 cell_id=cell.cell_id, n_cells=len(cells), reset_cam=reset_cam)
         toggles = {k: b.isChecked() for k, b in self._toggle_btns.items()}
         try:
             self.plotter.clear()
@@ -358,8 +360,10 @@ class ModelPane(QWidget):
                 self.plotter.render()
         except Exception as e:  # noqa: BLE001
             log.info("model.render_skipped", reason=str(e).splitlines()[0])
+        log.info("model.build_3d.done", cell_id=cell.cell_id)
 
     def _build_xsection(self, volume, cell: StormCell) -> None:
+        log.info("model.build_xsection.begin", cell_id=cell.cell_id)
         try:
             self.xplotter.clear()
         except Exception:  # noqa: BLE001
@@ -371,6 +375,7 @@ class ModelPane(QWidget):
                 self.xplotter.render()
         except Exception as e:  # noqa: BLE001
             log.info("model.xsection_skipped", reason=str(e).splitlines()[0])
+        log.info("model.build_xsection.done", cell_id=cell.cell_id)
 
     def _frame_axes(self, volume) -> None:
         ve = self._viewer.vert_exag

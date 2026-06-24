@@ -120,6 +120,12 @@ def _build_window(persist: bool):
             self.map.set_basemap()
             self._build_menu()
 
+            # Record the GL context once the render windows exist — the first
+            # thing to inspect if a render crashes on this display stack.
+            from .logging_setup import log_gl_info
+            log_gl_info(self.map.plotter, where="map")
+            log_gl_info(self.model.plotter, where="model3d")
+
             # Wiring.
             self.search.search_requested.connect(self.on_search)
             self.search.warning_selected.connect(self.on_select)
@@ -212,6 +218,9 @@ def _build_window(persist: bool):
             self.volumes.set_warning(warning)
             self.map.show_warning(warning)
 
+            log.info("download.start", warning=warning.id, event=warning.event,
+                     site=site.icao, issued=warning.issued.isoformat(),
+                     expires=warning.expires.isoformat())
             cancel = threading.Event()
             dialog = DownloadDialog(f"{site.icao}  {warning.event}", parent=self)
             worker = WarningWorker(warning, factory(), site, self.params, self.dsn, cancel)
@@ -235,6 +244,10 @@ def _build_window(persist: bool):
 
         def _on_volume(self, res) -> None:
             self._results.setdefault(res.warning.id, []).append(res)
+            log.info("gui.volume_done", warning=res.warning.id,
+                     valid_time=res.volume.valid_time.isoformat(),
+                     index=res.index, total=res.total, cells=len(res.cells),
+                     selected=(res.warning.id == self._selected_id))
             if res.warning.id == self._selected_id:
                 self.volumes.add_result(res)
                 self.map.show_result(res.warning, res.volume, res.cells)
@@ -249,6 +262,8 @@ def _build_window(persist: bool):
             # scrubbing (B2); for fixtures the registered grids serve directly.
             results = self._results.get(self._selected_id, [])
             factory = self._sources.get(self._selected_id)
+            log.info("gui.storm_selected", cell_id=c.cell_id, track_id=c.track_id,
+                     max_dbz=round(c.max_dbz, 1), n_volumes=len(results))
             self.model.show_cell(c, results, source_factory=factory)
             self.statusBar().showMessage(
                 f"Storm id {c.cell_id}  track {c.track_id}  "
@@ -415,11 +430,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--persist", action="store_true", help="write to PostGIS (PG_DSN)")
     p.add_argument("--from", dest="from_", metavar="ISO", help="live IEM start (UTC)")
     p.add_argument("--to", dest="to", metavar="ISO", help="live IEM end (UTC)")
+    p.add_argument("--log-level", metavar="LEVEL", default=None,
+                   help="debug|info|warning|error (default info; STORM_MODELER_LOG_LEVEL)")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    from .logging_setup import setup_logging
+
+    path = setup_logging(args.log_level)
+    log.info("app.start", mode=("smoke" if args.smoke else "headless"
+             if args.headless else "gui"), log_file=str(path))
     if args.smoke:
         return run_smoke(args)
     if args.headless:

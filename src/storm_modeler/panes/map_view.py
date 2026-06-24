@@ -123,10 +123,13 @@ class MapPane(QWidget):
                 self._cell_actors[c.track_id] = actor
 
     def show_result(self, warning: Warning, volume: GriddedVolume, cells) -> None:
+        log.info("map.show_result.begin", valid_time=volume.valid_time.isoformat(),
+                 n_cells=len(list(cells)), allow_render=self._allow_render)
         self.show_warning(warning)
         self.set_radar(volume)
         self.add_cells(list(cells))
         self.fit_view()
+        log.info("map.show_result.done", valid_time=volume.valid_time.isoformat())
 
     # --- interaction ------------------------------------------------------
 
