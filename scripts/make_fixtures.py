@@ -64,11 +64,18 @@ def build_tornado_case(root: Path) -> None:
         expires="2024-05-25T12:15:00Z",
     )
 
-    # Three volumes within issued-60..expires+30; a single cell tracking NE.
+    # Nine volumes within issued-60..expires+30 (10:41..12:45), every ~6 min;
+    # a single cell tracking NE. Enough volumes to exercise --cancel-after.
     steps = [
-        ("2024-05-25T11:42:00Z", 0.10, 0.04),
-        ("2024-05-25T11:48:00Z", 0.16, 0.08),
-        ("2024-05-25T11:54:00Z", 0.22, 0.12),
+        ("2024-05-25T11:42:00Z", 0.06, 0.02),
+        ("2024-05-25T11:48:00Z", 0.10, 0.05),
+        ("2024-05-25T11:54:00Z", 0.14, 0.08),
+        ("2024-05-25T12:00:00Z", 0.18, 0.11),
+        ("2024-05-25T12:06:00Z", 0.22, 0.14),
+        ("2024-05-25T12:12:00Z", 0.26, 0.17),
+        ("2024-05-25T12:18:00Z", 0.30, 0.20),
+        ("2024-05-25T12:24:00Z", 0.34, 0.23),
+        ("2024-05-25T12:30:00Z", 0.38, 0.26),
     ]
     for i, (t, dlon, dlat) in enumerate(steps, 1):
         vol = make_storm_volume(
