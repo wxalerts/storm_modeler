@@ -75,8 +75,54 @@ class ResolvedSettings:
     def iem_default_lookback_hours(self) -> int:
         return int(self.values["iem_default_lookback_hours"])
 
+    # -- Viewer (3D model pane) projections --------------------------------
+
+    @property
+    def viewer(self) -> "ViewerParams":
+        return ViewerParams.from_values(self.values)
+
     def get(self, key: str, default: Any = None) -> Any:
         return self.values.get(key, default)
+
+
+@dataclass(frozen=True)
+class ViewerParams:
+    """The 3D model-pane knob set (Phase B), projected from resolved settings."""
+
+    vol_floor_dbz: float = 20.0
+    iso_levels_dbz: tuple[float, ...] = (40.0, 50.0)
+    vert_exag: float = 2.0
+    xsection_azimuth_source: str = "track"
+    xsection_fixed_bearing: float = 0.0
+    grid_cache_size: int = 8
+
+    @staticmethod
+    def _parse_levels(raw: Any) -> tuple[float, ...]:
+        if isinstance(raw, (list, tuple)):
+            items = raw
+        else:
+            items = str(raw).replace(";", ",").split(",")
+        out: list[float] = []
+        for tok in items:
+            tok = str(tok).strip()
+            if not tok:
+                continue
+            try:
+                out.append(float(tok))
+            except ValueError:
+                continue
+        return tuple(sorted(set(out)))
+
+    @classmethod
+    def from_values(cls, values: dict[str, Any]) -> "ViewerParams":
+        return cls(
+            vol_floor_dbz=float(values.get("vol_floor_dbz", 20.0)),
+            iso_levels_dbz=cls._parse_levels(values.get("iso_levels_dbz", "40,50")),
+            vert_exag=float(values.get("vert_exag", 2.0)),
+            xsection_azimuth_source=str(values.get("xsection_azimuth_source", "track")),
+            xsection_fixed_bearing=float(values.get("xsection_fixed_bearing", 0.0)),
+            grid_cache_size=int(values.get("grid_cache_size", 8)),
+        )
 
 
 def resolve(dsn: str | None = None) -> ResolvedSettings:

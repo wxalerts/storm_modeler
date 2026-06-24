@@ -16,6 +16,7 @@ GROUP_DETECTION = "Detection"
 GROUP_DATA_WINDOW = "Data window"
 GROUP_IEM = "IEM"
 GROUP_DISPLAY = "Display"
+GROUP_VIEWER = "Viewer (3D)"
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,25 @@ REGISTRY: tuple[SettingSpec, ...] = (
                 "Toggle the states basemap layer."),
     SettingSpec("show_highways", "Show highways", GROUP_DISPLAY, "bool", True,
                 "Toggle the highways basemap layer."),
+    # -- Viewer (3D model pane, Phase B) -----------------------------------
+    SettingSpec("vol_floor_dbz", "Volume floor (dBZ)", GROUP_VIEWER, "float",
+                20.0, "Reflectivity below this is fully transparent in the 3D "
+                "volume render.", min=-30.0, max=80.0),
+    SettingSpec("iso_levels_dbz", "Isosurface levels (dBZ)", GROUP_VIEWER, "str",
+                "40,50", "Comma-separated dBZ values to draw as isosurface shells."),
+    SettingSpec("vert_exag", "Vertical exaggeration", GROUP_VIEWER, "float",
+                2.0, "Z-axis stretch applied to the 3D scene so structure is "
+                "readable; the axis is labelled in true km.", min=0.1, max=20.0),
+    SettingSpec("xsection_azimuth_source", "Cross-section azimuth source",
+                GROUP_VIEWER, "choice", "track", "How the vertical cross-section "
+                "plane is oriented.", choices=("track", "fixed", "manual")),
+    SettingSpec("xsection_fixed_bearing", "Cross-section fixed bearing (deg)",
+                GROUP_VIEWER, "float", 0.0, "Section bearing when the azimuth "
+                "source is 'fixed' (degrees from north, clockwise).",
+                min=0.0, max=360.0),
+    SettingSpec("grid_cache_size", "Grid cache size", GROUP_VIEWER, "int",
+                8, "Number of re-gridded volumes the viewer keeps in memory "
+                "(LRU) for responsive scrubbing.", min=1, max=64),
 )
 
 REGISTRY_BY_KEY: dict[str, SettingSpec] = {s.key: s for s in REGISTRY}
