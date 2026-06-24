@@ -14,6 +14,7 @@ bounded time window.
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -178,6 +179,107 @@ def grid_level2(
         lat0=lat0,
         lon0=lon0,
     )
+
+
+# --- Unidata THREDDS (anonymous HTTP) --------------------------------------
+
+#: Unidata's THREDDS Data Server mirrors the NEXRAD Level II archive over plain
+#: anonymous HTTP — no AWS credentials, no S3 (which some networks block). It
+#: retains a rolling window of recent days, which covers the live-warning case.
+THREDDS_CATALOG = "https://thredds.ucar.edu/thredds/catalog/nexrad/level2"
+THREDDS_FILESERVER = "https://thredds.ucar.edu/thredds/fileServer"
+_THREDDS_NS = {"t": "http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0"}
+#: ``Level2_KFTG_20260624_2301.ar2v`` -> (date, hhmm).
+_THREDDS_NAME = re.compile(r"_(\d{8})_(\d{4})")
+
+
+class ThreddsLevel2Source(VolumeSource):
+    """Archived Level II volumes for ``site`` in ``[start, end]`` via Unidata.
+
+    Lists each day's THREDDS catalog, keeps the volumes whose filename time
+    falls in the window, downloads each ``.ar2v`` over anonymous HTTP, and grids
+    it with Py-ART — the same :class:`GriddedVolume` contract the S3 path
+    produces. ``httpx`` + ``pyart`` are imported lazily (the ``live`` extra).
+    """
+
+    def __init__(
+        self,
+        site: str,
+        start: datetime,
+        end: datetime,
+        lat0: float,
+        lon0: float,
+        grid: GridConfig = DEFAULT_GRID,
+        h_km: float = 1.0,
+        v_km: float = 0.5,
+    ) -> None:
+        self.site = site.upper()
+        self.start = start.astimezone(timezone.utc)
+        self.end = end.astimezone(timezone.utc)
+        self.lat0 = lat0
+        self.lon0 = lon0
+        self.grid = grid
+        self.h_km = h_km
+        self.v_km = v_km
+
+    @staticmethod
+    def _name_time(name: str) -> datetime | None:
+        m = _THREDDS_NAME.search(name)
+        if not m:
+            return None
+        try:
+            return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            return None
+
+    def _list_keys(self) -> list[tuple[datetime, str]]:
+        """(`valid_time`, `urlPath`) for every volume in the window, time-sorted."""
+        import httpx  # type: ignore
+        from xml.etree import ElementTree as ET
+
+        out: list[tuple[datetime, str]] = []
+        day = self.start.date()
+        while day <= self.end.date():
+            url = f"{THREDDS_CATALOG}/{self.site}/{day:%Y%m%d}/catalog.xml"
+            try:
+                resp = httpx.get(url, timeout=60, follow_redirects=True)
+                if resp.status_code == 200:
+                    root = ET.fromstring(resp.text)
+                    for ds in root.findall(".//t:dataset", _THREDDS_NS):
+                        path = ds.get("urlPath")
+                        name = ds.get("name") or ""
+                        if not path or not name.endswith(".ar2v"):
+                            continue
+                        t = self._name_time(name)
+                        if t is not None and self.start <= t <= self.end:
+                            out.append((t, path))
+            except Exception as e:  # noqa: BLE001 - skip a missing/parse-failed day
+                log.info("thredds.day_skipped", day=str(day), reason=str(e).splitlines()[0])
+            day += timedelta(days=1)
+        out.sort(key=lambda p: p[0])
+        return out
+
+    def volumes(self) -> Iterator[GriddedVolume]:
+        import io
+
+        import httpx  # type: ignore
+
+        keys = self._list_keys()
+        log.info("thredds.window", site=self.site, n=len(keys),
+                 start=self.start.isoformat(), end=self.end.isoformat())
+        with httpx.Client(timeout=180, follow_redirects=True) as client:
+            for t, path in keys:
+                url = f"{THREDDS_FILESERVER}/{path}"
+                log.info("thredds.read", url=url, valid_time=t.isoformat())
+                resp = client.get(url)
+                resp.raise_for_status()
+                vol = grid_level2(
+                    io.BytesIO(resp.content), self.site, self.lat0, self.lon0,
+                    self.grid, self.h_km, self.v_km,
+                )
+                yield vol
 
 
 class FixtureVolumeSource(VolumeSource):
