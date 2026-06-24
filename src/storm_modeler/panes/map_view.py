@@ -48,16 +48,19 @@ class MapPane(QWidget):
         import pyvista as pv
         from pyvistaqt import QtInteractor
 
-        # Render to an offscreen GL buffer when there is no usable display
-        # (the smoke test / any headless GL environment). With a real display
-        # (e.g. under Xvfb) the interactor is shown live and is interactive.
+        # A real display (an X server, incl. Xvfb) means VTK has a working GL
+        # context and we render live — this holds even under the Qt "offscreen"
+        # platform, where the QWidget is windowless but VTK drives its own GL
+        # window on DISPLAY. With no display at all we fall back to an offscreen
+        # GL buffer and skip live renders (see _allow_render).
         if off_screen is None:
-            off_screen = (
-                bool(pv.OFF_SCREEN)
-                or os.environ.get("QT_QPA_PLATFORM") == "offscreen"
-                or not os.environ.get("DISPLAY")
-            )
+            off_screen = not os.environ.get("DISPLAY")
         self.off_screen = off_screen
+        # Live GL renders are only performed when there is a real display.
+        # Offscreen software GL on some headless stacks intermittently aborts
+        # during shader compilation; in that mode we still build every actor
+        # (so the panes are fully instantiated) but skip the render() calls.
+        self._allow_render = not off_screen
         self.plotter = QtInteractor(self, off_screen=off_screen)
         if off_screen:
             # The interactor widget is never shown offscreen, so its viewport
@@ -144,7 +147,8 @@ class MapPane(QWidget):
             cam.position = (lon, lat, 100.0)
             cam.up = (0.0, 1.0, 0.0)
             cam.parallel_scale = span_deg
-            self.plotter.render()
+            if self._allow_render:
+                self.plotter.render()
         except Exception as e:  # noqa: BLE001
             log.info("map.recenter_skipped", reason=str(e).splitlines()[0])
 
@@ -157,7 +161,7 @@ class MapPane(QWidget):
                     (lat0 + lat1) / 2,
                     span_deg=max(lon1 - lon0, lat1 - lat0) / 2 * 1.1,
                 )
-            else:
+            elif self._allow_render:
                 self.plotter.reset_camera()
                 self.plotter.render()
         except Exception as e:  # noqa: BLE001

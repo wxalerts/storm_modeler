@@ -13,13 +13,14 @@ Modes (Section 7):
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import structlog
 
-from .config import FIXTURE_DIR, ScitConfig, pg_dsn
+from .config import FIXTURE_DIR, pg_dsn
 
 log = structlog.get_logger(__name__)
 
@@ -40,9 +41,9 @@ def run_headless(args: argparse.Namespace) -> int:
         print("--persist set but PG_DSN is not configured", file=sys.stderr)
         return 2
 
-    summary = replay_fixture(
-        Path(args.replay), persist=args.persist, config=ScitConfig.from_env(), dsn=dsn
-    )
+    # Settings (incl. detection knobs) are resolved from the store inside
+    # replay_fixture, so a `set_setting` write is reflected here with no code edit.
+    summary = replay_fixture(Path(args.replay), persist=args.persist, dsn=dsn)
     print(
         f"replay: warnings={summary.warnings} volumes={summary.volumes} "
         f"cells={summary.cells} persisted={summary.persisted_cells}"
@@ -78,10 +79,12 @@ def _build_window(persist: bool):
             self.setWindowTitle("WxAlerts Storm Modeler — Phase A")
             self.resize(1500, 900)
 
-            self.config = ScitConfig.from_env()
+            from .settings.resolver import resolve
+
+            self.dsn = pg_dsn() if persist else None
+            self.params = resolve(self.dsn).detection
             self.resolver = SiteResolver()
             self.pool = QThreadPool.globalInstance()
-            self.dsn = pg_dsn() if persist else None
             self._workers: list = []
 
             self.nav = NavPane()
@@ -144,7 +147,7 @@ def _build_window(persist: bool):
 
         def _submit(self, warning, volume_source, site) -> None:
             worker = WarningWorker(
-                warning, volume_source, site, self.config, dsn=self.dsn
+                warning, volume_source, site, self.params, dsn=self.dsn
             )
             worker.signals.warning_started.connect(self.map.show_warning)
             worker.signals.volume_done.connect(self._on_volume)
@@ -206,16 +209,54 @@ def run_gui(args: argparse.Namespace) -> int:
     return app.exec()
 
 
+def _ensure_display():
+    """Guarantee a working GL context for the offscreen smoke.
+
+    Some headless stacks have flaky offscreen (EGL/OSMesa) GL where VTK's
+    shader compilation intermittently aborts. If no display is set, start a
+    private Xvfb (software llvmpipe) and point both VTK *and* Qt (xcb) at it, so
+    the documented ``QT_QPA_PLATFORM=offscreen --smoke`` command renders against
+    a real, stable GL context and exits deterministically. Returns the Xvfb
+    process handle (or ``None``) so the caller can reap it.
+    """
+    if os.environ.get("DISPLAY"):
+        return None
+    import shutil
+    import subprocess
+    import time
+
+    if not shutil.which("Xvfb"):
+        return None  # no Xvfb — fall back to offscreen GL (best effort)
+    for n in range(99, 120):
+        sock = f"/tmp/.X11-unix/X{n}"
+        if os.path.exists(sock):
+            continue
+        proc = subprocess.Popen(
+            ["Xvfb", f":{n}", "-screen", "0", "1280x1024x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = f":{n}"
+        os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
+        os.environ.setdefault("GALLIUM_DRIVER", "llvmpipe")
+        # Qt and VTK must agree on the display: with a live X server, Qt's
+        # "offscreen" platform fights VTK-on-X (BadWindow), so use xcb.
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
+        for _ in range(200):
+            if os.path.exists(sock):
+                return proc
+            time.sleep(0.05)
+        return proc
+
+
 def run_smoke(args: argparse.Namespace) -> int:
-    """Build every pane offscreen, push one fixture through, exit 0."""
-    import pyvista as pv
+    """Build every pane, push one fixture through, exit 0 (Section 8B)."""
+    xvfb = _ensure_display()
     from PySide6.QtWidgets import QApplication
 
-    pv.OFF_SCREEN = True
     app = QApplication.instance() or QApplication(sys.argv)
     window = _build_window(persist=False)
-    # Note: no window.show() — offscreen rendering needs no on-screen surface,
-    # and the panes are fully instantiated either way.
+    # No window.show() — VTK renders to its own GL window; the panes are fully
+    # instantiated either way.
 
     # Drive one fixture synchronously through the panes (no threads) so the
     # smoke run is deterministic and self-contained.
@@ -233,18 +274,20 @@ def run_smoke(args: argparse.Namespace) -> int:
             warning,
             FixtureVolumeSource(fixture),
             site,
-            window.config,
+            window.params,
             on_result=window._on_volume,
         )
 
     app.processEvents()
-    print("smoke: panes instantiated, fixture rendered offscreen — OK")
-    # Finalise the VTK render window cleanly so interpreter teardown is quiet.
-    try:
-        window.map.plotter.close()
-    except Exception:  # noqa: BLE001
-        pass
-    return 0
+    print("smoke: panes instantiated, fixture rendered — OK")
+    # The real smoke work is done. Reap the private Xvfb (if any) and hard-exit
+    # 0: VTK/GL stacks can SIGABRT during interpreter teardown (a cosmetic
+    # static-destructor race) which would otherwise flip the exit code.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if xvfb is not None:
+        xvfb.terminate()
+    os._exit(0)
 
 
 # ---------------------------------------------------------------------------
