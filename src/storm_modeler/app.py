@@ -98,7 +98,7 @@ def _build_window(persist: bool):
             self.search = LeftSearchPane(self.settings)
             self.volumes = LeftVolumesPane()
             self.map = MapPane()
-            self.model = ModelPane()
+            self.model = ModelPane(self.settings)
 
             # Left panel: vertical split (search on top, volumes below).
             left = QSplitter(Qt.Vertical)
@@ -145,6 +145,7 @@ def _build_window(persist: bool):
         def reload_settings(self) -> None:
             self.settings = resolve(self.dsn)
             self.params = self.settings.detection
+            self.model.set_settings(self.settings)
             self.statusBar().showMessage(
                 f"Settings reloaded (detection hash {self.params.settings_hash})"
             )
@@ -236,6 +237,12 @@ def _build_window(persist: bool):
             )
 
         def _on_storm(self, c) -> None:
+            # Drive pane 3: load that cell's volume and build the 3D scene. The
+            # source factory re-grids any volume evicted from the LRU during
+            # scrubbing (B2); for fixtures the registered grids serve directly.
+            results = self._results.get(self._selected_id, [])
+            factory = self._sources.get(self._selected_id)
+            self.model.show_cell(c, results, source_factory=factory)
             self.statusBar().showMessage(
                 f"Storm id {c.cell_id}  track {c.track_id}  "
                 f"{c.max_dbz:.1f} dBZ  depth {c.depth_km:.1f} km"
@@ -264,23 +271,38 @@ def run_gui(args: argparse.Namespace) -> int:
 
 
 def _ensure_display():
-    """Guarantee a working GL context for the offscreen smoke.
+    """Guarantee a working, self-consistent GL context for the offscreen smoke.
 
-    Some headless stacks have flaky offscreen (EGL/OSMesa) GL where VTK's
-    shader compilation intermittently aborts. If no display is set, start a
-    private Xvfb (software llvmpipe) and point both VTK *and* Qt (xcb) at it, so
-    the documented ``QT_QPA_PLATFORM=offscreen --smoke`` command renders against
-    a real, stable GL context and exits deterministically. Returns the Xvfb
-    process handle (or ``None``) so the caller can reap it.
+    The documented invocation sets ``QT_QPA_PLATFORM=offscreen``, but VTK's
+    embedded interactor still drives a real X window when a ``DISPLAY`` is
+    present — so an offscreen Qt platform *fighting* VTK-on-X aborts with
+    BadWindow. The fix is to make Qt and VTK agree on one display:
+
+    * a ``DISPLAY`` is already present → render live on it under ``xcb`` (Qt and
+      VTK now share the same X server). This is the common dev-box path;
+    * no ``DISPLAY`` but ``Xvfb`` is available → start a private Xvfb (software
+      llvmpipe) and point Qt + VTK at it;
+    * neither → fall back to pure offscreen GL (EGL/OSMesa) under the offscreen
+      platform; may be flaky on GL-less stacks, but nothing better is available.
+
+    Returns the Xvfb process handle (or ``None``) so the caller can reap it.
     """
-    if os.environ.get("DISPLAY"):
-        return None
     import shutil
     import subprocess
     import time
 
+    if os.environ.get("DISPLAY"):
+        # Qt and VTK must agree on the display: the documented offscreen Qt
+        # platform makes Qt windowless while VTK still drives an X window
+        # (BadWindow). Switch Qt to xcb so both use the live server.
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
+        return None
     if not shutil.which("Xvfb"):
-        return None  # no Xvfb — fall back to offscreen GL (best effort)
+        # No display and no Xvfb: pure offscreen GL is the only option.
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        return None
+    # No display but Xvfb is available: stand up a private one for a stable,
+    # self-consistent Qt + VTK context.
     for n in range(99, 120):
         sock = f"/tmp/.X11-unix/X{n}"
         if os.path.exists(sock):
