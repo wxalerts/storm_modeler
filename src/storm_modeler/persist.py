@@ -31,6 +31,12 @@ log = structlog.get_logger(__name__)
 SCHEMA_SQL = """
 CREATE EXTENSION IF NOT EXISTS postgis;
 
+CREATE TABLE IF NOT EXISTS app_settings (
+    key        text PRIMARY KEY,
+    value      jsonb NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS warnings_v2 (
     id            text PRIMARY KEY,
     event         text NOT NULL,
@@ -51,6 +57,7 @@ CREATE TABLE IF NOT EXISTS cells_v2 (
     id           bigserial,
     warning_id   text REFERENCES warnings_v2 (id) ON DELETE CASCADE,
     event_type   text,
+    settings_hash text,
     site         text NOT NULL,
     valid_time   timestamptz NOT NULL,
     track_id     integer NOT NULL,
@@ -159,7 +166,11 @@ class Persistence:
         self._conn.commit()
 
     def upsert_cells(
-        self, warning_id: str, event_type: str, cells: Iterable[StormCell]
+        self,
+        warning_id: str,
+        event_type: str,
+        cells: Iterable[StormCell],
+        settings_hash: str | None = None,
     ) -> int:
         from shapely import wkb
         from shapely.geometry import Point
@@ -171,15 +182,16 @@ class Persistence:
                 cur.execute(
                     """
                     INSERT INTO cells_v2
-                        (warning_id, event_type, site, valid_time, track_id,
-                         cell_id, seed_lon, seed_lat, max_dbz, area_km2,
+                        (warning_id, event_type, settings_hash, site, valid_time,
+                         track_id, cell_id, seed_lon, seed_lat, max_dbz, area_km2,
                          echo_top_km, base_km, depth_km, n_levels,
                          centroid, envelope)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                             ST_GeomFromWKB(%s,4326), ST_GeomFromWKB(%s,4326))
                     ON CONFLICT (warning_id, site, valid_time, track_id)
                     DO UPDATE SET
                         event_type=EXCLUDED.event_type,
+                        settings_hash=EXCLUDED.settings_hash,
                         cell_id=EXCLUDED.cell_id,
                         seed_lon=EXCLUDED.seed_lon,
                         seed_lat=EXCLUDED.seed_lat,
@@ -193,9 +205,10 @@ class Persistence:
                         envelope=EXCLUDED.envelope
                     """,
                     (
-                        warning_id, event_type, c.site, c.valid_time, c.track_id,
-                        c.cell_id, c.seed_lon, c.seed_lat, c.max_dbz, c.area_km2,
-                        c.echo_top_km, c.base_km, c.depth_km, c.n_levels,
+                        warning_id, event_type, settings_hash, c.site,
+                        c.valid_time, c.track_id, c.cell_id, c.seed_lon,
+                        c.seed_lat, c.max_dbz, c.area_km2, c.echo_top_km,
+                        c.base_km, c.depth_km, c.n_levels,
                         wkb.dumps(pt), wkb.dumps(c.envelope),
                     ),
                 )

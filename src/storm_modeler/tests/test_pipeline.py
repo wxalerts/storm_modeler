@@ -4,13 +4,19 @@ from __future__ import annotations
 
 from storm_modeler.config import FIXTURE_DIR
 from storm_modeler.pipeline import replay_fixture
+from storm_modeler.settings.resolver import resolve_from_values
+
+# Hermetic: pure registry defaults, never whatever overrides sit in a live DB.
+DEFAULTS = resolve_from_values({})
 
 
 def test_tornado_fixture_tracks_a_deep_cell():
-    s = replay_fixture(FIXTURE_DIR / "tornado_warning_case", persist=False)
+    s = replay_fixture(
+        FIXTURE_DIR / "tornado_warning_case", persist=False, settings=DEFAULTS
+    )
     assert s.warnings == 1
-    assert s.volumes == 3
-    assert s.cells >= 3  # one cell per volume, tracked
+    assert s.volumes == 9
+    assert s.cells == s.volumes  # one tracked cell per volume
 
     # Same track id across all volumes; realistic depth inside the window.
     track_ids = {c.track_id for r in s.results for c in r.cells}
@@ -30,15 +36,15 @@ def test_tornado_fixture_tracks_a_deep_cell():
 
 
 def test_ap_fixture_admits_zero_cells():
-    s = replay_fixture(FIXTURE_DIR / "ap_case", persist=False)
+    s = replay_fixture(FIXTURE_DIR / "ap_case", persist=False, settings=DEFAULTS)
     assert s.warnings == 1
     assert s.volumes == 1
     assert s.cells == 0
 
 
 def test_replay_is_deterministic():
-    a = replay_fixture(FIXTURE_DIR / "tornado_warning_case", persist=False)
-    b = replay_fixture(FIXTURE_DIR / "tornado_warning_case", persist=False)
+    a = replay_fixture(FIXTURE_DIR / "tornado_warning_case", persist=False, settings=DEFAULTS)
+    b = replay_fixture(FIXTURE_DIR / "tornado_warning_case", persist=False, settings=DEFAULTS)
     da = [c.to_dict() for r in a.results for c in r.cells]
     db = [c.to_dict() for r in b.results for c in r.cells]
     assert da == db
