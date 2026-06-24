@@ -1,0 +1,97 @@
+"""Settings resolver — defaults ⊕ overrides → typed params.
+
+``resolve()`` merges registry defaults with PostGIS overrides into a flat dict,
+then projects it into typed views: :class:`DetectionParams` for SCIT, plus
+convenience accessors for the data window, IEM defaults, and display prefs.
+
+Every :class:`DetectionParams` carries a ``settings_hash`` — a stable digest of
+its knob set — so a detection row can be traced back to the exact tuning that
+produced it.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+from .registry import DETECTION_KEYS, defaults
+from .store import SettingsStore
+
+
+@dataclass(frozen=True)
+class DetectionParams:
+    """The SCIT knob set. Passed explicitly to ``detection_v2.run`` — no globals."""
+
+    seed_dbz: float = 40.0
+    base_dbz: float = 30.0
+    seed_min_separation_km: float = 6.0
+    echo_top_min_km: float = 3.0
+    continuity_dbz: float = 18.3
+    continuity_levels: int = 3
+    min_area_km2: float = 4.0
+    grid_h_km: float = 1.0
+    grid_v_km: float = 0.5
+    watershed_split: bool = False
+    track_max_km: float = 12.0
+    track_miss_max: int = 2
+
+    @property
+    def settings_hash(self) -> str:
+        """Stable short digest of the knob set (provenance)."""
+        payload = json.dumps(asdict(self), sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "DetectionParams":
+        return cls(**{k: d[k] for k in DETECTION_KEYS if k in d})
+
+
+@dataclass(frozen=True)
+class ResolvedSettings:
+    """The full resolved settings dict plus typed projections."""
+
+    values: dict[str, Any]
+
+    @property
+    def detection(self) -> DetectionParams:
+        return DetectionParams.from_dict(self.values)
+
+    @property
+    def pre_minutes(self) -> int:
+        return int(self.values["pre_minutes"])
+
+    @property
+    def post_minutes(self) -> int:
+        return int(self.values["post_minutes"])
+
+    @property
+    def iem_default_states(self) -> list[str]:
+        raw = str(self.values.get("iem_default_states", "")).strip()
+        return [s.strip().upper() for s in raw.split(",") if s.strip()]
+
+    @property
+    def iem_default_lookback_hours(self) -> int:
+        return int(self.values["iem_default_lookback_hours"])
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.values.get(key, default)
+
+
+def resolve(dsn: str | None = None) -> ResolvedSettings:
+    """Resolve registry defaults ⊕ DB overrides. DB-less callers get defaults."""
+    merged = defaults()
+    try:
+        with SettingsStore(dsn) as store:
+            merged.update(store.overrides())
+    except RuntimeError:
+        # No PG_DSN — fall back to pure registry defaults (e.g. offline tests).
+        pass
+    return ResolvedSettings(values=merged)
+
+
+def resolve_from_values(values: dict[str, Any]) -> ResolvedSettings:
+    merged = defaults()
+    merged.update(values)
+    return ResolvedSettings(values=merged)
