@@ -1,0 +1,52 @@
+"""Settings registry validation and (DB-gated) store round-trip."""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+
+from storm_modeler.settings.registry import REGISTRY, get_spec
+from storm_modeler.settings.resolver import DetectionParams, resolve_from_values
+
+
+def test_registry_validation_bounds_and_choices():
+    spec = get_spec("seed_dbz")
+    assert spec.validate("50") == 50.0
+    with pytest.raises(ValueError):
+        spec.validate(999)  # above max
+    cont = get_spec("continuity_levels")
+    assert cont.validate(3) == 3
+    color = get_spec("dbz_color_table")
+    with pytest.raises(ValueError):
+        color.validate("rainbow")  # not a choice
+
+
+def test_every_detection_key_is_registered():
+    from storm_modeler.settings.registry import DETECTION_KEYS
+
+    for k in DETECTION_KEYS:
+        get_spec(k)  # raises if missing
+    # DetectionParams fields all come from registered keys.
+    for f in DetectionParams().__dataclass_fields__:
+        assert f in {s.key for s in REGISTRY}
+
+
+def test_resolver_projects_typed_params():
+    rs = resolve_from_values({"seed_dbz": 55, "track_max_km": 20})
+    p = rs.detection
+    assert p.seed_dbz == 55.0 and p.track_max_km == 20.0
+    assert p.settings_hash != DetectionParams().settings_hash
+
+
+@pytest.mark.skipif(not os.environ.get("PG_DSN"), reason="needs PG_DSN")
+def test_store_round_trip_changes_resolved_params():
+    from storm_modeler.settings.resolver import resolve
+    from storm_modeler.settings.store import SettingsStore
+
+    with SettingsStore() as store:
+        store.set("seed_dbz", 63)
+        try:
+            assert resolve().detection.seed_dbz == 63.0
+        finally:
+            store.unset("seed_dbz")
