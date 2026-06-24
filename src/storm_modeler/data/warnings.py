@@ -119,16 +119,24 @@ class IEMHistoricalSource(WarningSource):
         start: datetime,
         end: datetime,
         states: Iterable[str] | None = None,
+        phenomena: Iterable[str] | None = None,
         cache_dir: Path | None = None,
     ) -> None:
         self.start = start
         self.end = end
         self.states = sorted(s.upper() for s in states) if states else None
+        # Which VTEC phenomena to admit (significance W). Defaults to both the
+        # admitted types; the search form narrows it via the event checkboxes.
+        chosen = [p.upper() for p in phenomena] if phenomena is not None else None
+        self.phenomena = tuple(
+            p for p in sorted(set(chosen)) if p in ADMITTED_PHENOMENA
+        ) if chosen is not None else tuple(sorted(ADMITTED_PHENOMENA))
         self.cache_dir = Path(cache_dir or CACHE_DIR) / "iem_warnings"
 
     def _cache_key(self) -> str:
         st = "+".join(self.states) if self.states else "ALL"
-        return f"{_iso_z(self.start)}_{_iso_z(self.end)}_{st}".replace(":", "")
+        ph = "+".join(self.phenomena) if self.phenomena else "NONE"
+        return f"{_iso_z(self.start)}_{_iso_z(self.end)}_{st}_{ph}".replace(":", "")
 
     def _cache_path(self) -> Path:
         return self.cache_dir / f"{self._cache_key()}.json"
@@ -147,8 +155,8 @@ class IEMHistoricalSource(WarningSource):
             "timeopt": "1",
             "accept": "shapefile",
             "limitps": "yes",
-            "phenomena": ["TO", "SV"],
-            "significance": ["W", "W"],
+            "phenomena": list(self.phenomena),
+            "significance": ["W"] * len(self.phenomena),
         }
         if self.states:
             params["states"] = self.states
@@ -223,10 +231,13 @@ class IEMHistoricalSource(WarningSource):
         # several shapefile rows — polygon updates / continued segments — so
         # emit each warning once, keyed by its stable id.
         seen: set[str] = set()
+        chosen = set(self.phenomena)
         for rec in self._fetch_raw():
             ph = str(rec.get("phenomena", "")).upper()
             sig = str(rec.get("significance", "")).upper()
-            if not _admit(ph, sig):
+            # Admit only the selected phenomena at significance W (defends in
+            # code even if the server-side filter is loose).
+            if sig != ADMITTED_SIGNIFICANCE or ph not in chosen:
                 continue
             wfo = rec.get("wfo", "")
             etn = rec.get("etn", 0)

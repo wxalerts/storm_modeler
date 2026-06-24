@@ -48,9 +48,9 @@ def test_request_params_match_iem_contract():
     assert p["sts"] == "2024-05-25T11:00Z"
     assert p["ets"] == "2024-05-25T14:00Z"
     assert p["accept"] == "shapefile"
-    # phenomena/significance are positionally aligned (TO,W) & (SV,W).
-    assert p["phenomena"] == ["TO", "SV"]
-    assert p["significance"] == ["W", "W"]
+    # phenomena/significance are positionally aligned, each at significance W.
+    assert sorted(p["phenomena"]) == ["SV", "TO"]
+    assert p["significance"] == ["W"] * len(p["phenomena"])
     assert len(p["phenomena"]) == len(p["significance"])
     assert p["states"] == ["OK", "TX"]              # sorted, upper-cased
 
@@ -110,3 +110,27 @@ def test_warnings_dedupes_repeated_vtec_event(monkeypatch):
     assert [w.etn for w in out] == [84, 85]         # de-duplicated by id
     assert out[0].id == "2024-05-25-FWD-TOW-84"
     assert out[0].issued.isoformat() == "2024-05-25T11:42:00+00:00"
+
+
+def test_phenomena_selection_filters_results(monkeypatch):
+    poly = mapping(box(-97.5, 32.4, -97.0, 32.9))
+
+    def rec(ph, etn):
+        return {
+            "phenomena": ph, "significance": "W", "wfo": "FWD", "etn": etn,
+            "issued": "202405251142", "expires": "202405251215",
+            "ugc": [], "status": "NEW", "geometry": poly,
+        }
+
+    raw = [rec("TO", 1), rec("SV", 2)]
+
+    # Tornado-only: the SV warning is excluded, and the request asks for TO only.
+    src = IEMHistoricalSource(
+        datetime(2024, 5, 25, 11, tzinfo=timezone.utc),
+        datetime(2024, 5, 25, 14, tzinfo=timezone.utc),
+        phenomena=["TO"],
+    )
+    monkeypatch.setattr(src, "_fetch_raw", lambda: raw)
+    assert [w.phenomena for w in src.warnings()] == ["TO"]
+    assert src._request_params()["phenomena"] == ["TO"]
+    assert "_TO" in src._cache_key()             # cache split by selection

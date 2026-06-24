@@ -67,7 +67,7 @@ def _build_window(persist: bool):
     from PySide6.QtWidgets import QMainWindow, QSplitter, QStatusBar
 
     from .data.sites import SiteResolver
-    from .data.volumes import FixtureVolumeSource, NexradArchiveSource, bounded_window
+    from .data.volumes import FixtureVolumeSource, ThreddsLevel2Source, bounded_window
     from .data.warnings import FixtureWarningSource
     from .dialogs.download_dialog import DownloadDialog
     from .dialogs.settings_dialog import SettingsDialog
@@ -154,8 +154,15 @@ def _build_window(persist: bool):
 
         def on_search(self, params) -> None:
             self.search.clear_results()
+            phenomena = ([] + (["TO"] if params.tornado else [])
+                         + (["SV"] if params.severe else []))
+            if not phenomena:
+                self.statusBar().showMessage("Select at least one event type.")
+                return
             self.search.set_searching(True)
-            worker = SearchWorker(params.start, params.end, params.states or None)
+            worker = SearchWorker(
+                params.start, params.end, params.states or None, phenomena=phenomena
+            )
             worker.signals.warning.connect(lambda w: self._add_result(w, params))
             worker.signals.error.connect(
                 lambda m: self.statusBar().showMessage(f"IEM search failed: {m}")
@@ -169,7 +176,7 @@ def _build_window(persist: bool):
             w0, w1 = bounded_window(
                 warning.issued, warning.expires, params.pre_minutes, params.post_minutes
             )
-            self._sources[warning.id] = lambda: NexradArchiveSource(
+            self._sources[warning.id] = lambda: ThreddsLevel2Source(
                 site.icao, w0, w1, site.lat, site.lon,
                 h_km=self.params.grid_h_km, v_km=self.params.grid_v_km,
             )

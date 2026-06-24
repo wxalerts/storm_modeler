@@ -42,11 +42,12 @@ class SearchSignals(QObject):
 class SearchWorker(QRunnable):
     """Run an IEM historical query off the GUI thread, emitting each warning."""
 
-    def __init__(self, start, end, states=None) -> None:
+    def __init__(self, start, end, states=None, phenomena=None) -> None:
         super().__init__()
         self.start = start
         self.end = end
         self.states = states
+        self.phenomena = phenomena
         self.signals = SearchSignals()
 
     @Slot()
@@ -54,7 +55,9 @@ class SearchWorker(QRunnable):
         from .data.warnings import IEMHistoricalSource
 
         try:
-            for w in IEMHistoricalSource(self.start, self.end, self.states):
+            for w in IEMHistoricalSource(
+                self.start, self.end, self.states, phenomena=self.phenomena
+            ):
                 self.signals.warning.emit(w)
         except Exception as e:  # noqa: BLE001
             self.signals.error.emit(f"{type(e).__name__}: {e}")
