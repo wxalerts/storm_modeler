@@ -57,6 +57,49 @@ def _iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
 
 
+def _normalize_ts(value) -> str:
+    """Normalise an IEM watchwarn timestamp to an ISO-8601 UTC string.
+
+    The watchwarn shapefile encodes ISSUED/EXPIRED as compact UTC
+    ``YYYYMMDDHHMM`` (or ``…SS``) strings, which ``datetime.fromisoformat``
+    rejects. Accept those, pass ISO strings through unchanged, and leave
+    anything unrecognised for the model layer to reject loudly.
+    """
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    try:  # already ISO (with or without a trailing Z)?
+        datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return s
+    except ValueError:
+        pass
+    # Compact IEM UTC. Dispatch by length: strptime's field regexes backtrack,
+    # so "%Y%m%d%H%M%S" would mis-parse a 12-digit string (HHMM as H,M,S).
+    fmt = {12: "%Y%m%d%H%M", 14: "%Y%m%d%H%M%S"}.get(len(s)) if s.isdigit() else None
+    if fmt:
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).isoformat()
+        except ValueError:
+            pass
+    return s
+
+
+def _largest_polygon_mapping(geom):
+    """GeoJSON mapping of ``geom``, reducing a MultiPolygon to its largest part.
+
+    Downstream rendering (map envelopes, the 3D prism) assumes a single
+    ``Polygon`` exterior; a few SBWs arrive as MultiPolygons, so keep the
+    dominant lobe rather than crashing on ``.exterior``.
+    """
+    from shapely.geometry import mapping
+
+    if geom is not None and getattr(geom, "geom_type", "") == "MultiPolygon":
+        geom = max(geom.geoms, key=lambda g: g.area)
+    return mapping(geom)
+
+
 class IEMHistoricalSource(WarningSource):
     """Pull SBW polygons by time range from the IEM watchwarn service.
 
@@ -91,17 +134,24 @@ class IEMHistoricalSource(WarningSource):
         return self.cache_dir / f"{self._cache_key()}.json"
 
     def _request_params(self) -> dict:
+        # IEM watchwarn GIS params (verified against the live service):
+        #  * ``timeopt=1`` selects start/end *range* mode — without it ``sts``/
+        #    ``ets`` are ignored and the service returns current warnings.
+        #  * ``phenomena``/``significance`` are positionally-aligned lists, so
+        #    TO and SV each need their own ``W``. ``limitps=yes`` activates them.
+        #  * ``states`` is the documented state filter (best-effort: the service
+        #    does not constrain SBW polygons by it, so we still filter in code).
         params = {
             "sts": _iso_z(self.start),
             "ets": _iso_z(self.end),
+            "timeopt": "1",
             "accept": "shapefile",
-            # Limit to warnings; we still filter TO/SV W in code.
             "limitps": "yes",
-            "ph[]": ["TO", "SV"],
-            "sig[]": ["W"],
+            "phenomena": ["TO", "SV"],
+            "significance": ["W", "W"],
         }
         if self.states:
-            params["states[]"] = self.states
+            params["states"] = self.states
         return params
 
     def _fetch_raw(self) -> list[dict]:
@@ -142,29 +192,37 @@ class IEMHistoricalSource(WarningSource):
 
     @staticmethod
     def _row_to_record(row) -> dict:
-        from shapely.geometry import mapping
-
         def g(*names, default=None):
             for n in names:
-                if n in row and row[n] is not None:
-                    return row[n]
+                if n in row:
+                    v = row[n]
+                    # Skip missing values, incl. GeoPandas' float NaN for empty
+                    # DBF cells (e.g. NWS_UGC on a polygon-only warning).
+                    if v is not None and not (isinstance(v, float) and v != v):
+                        return v
             return default
 
-        ugc = g("UGC", "ugc", default="")
+        ugc = g("UGC", "NWS_UGC", "ugc", default="")
         ugc_list = [u for u in str(ugc).split(",") if u] if ugc else []
         return {
             "phenomena": g("PHENOM", "phenomena", default=""),
             "significance": g("SIG", "significance", default=""),
             "wfo": g("WFO", "wfo", default=""),
             "etn": int(g("ETN", "eventid", default=0) or 0),
-            "issued": str(g("ISSUED", "issue", default="")),
-            "expires": str(g("EXPIRED", "expire", default="")),
+            # Prefer the stable *initial* VTEC issue/expire so the event's times
+            # are the same on every segment row (dedup becomes order-independent).
+            "issued": _normalize_ts(g("INIT_ISS", "ISSUED", "issue", default="")),
+            "expires": _normalize_ts(g("INIT_EXP", "EXPIRED", "expire", default="")),
             "ugc": ugc_list,
             "status": g("STATUS", "status", default=""),
-            "geometry": mapping(row.geometry),
+            "geometry": _largest_polygon_mapping(row.geometry),
         }
 
     def warnings(self) -> Iterator[Warning]:
+        # A single VTEC event (one wfo+phenomena+significance+etn) arrives as
+        # several shapefile rows — polygon updates / continued segments — so
+        # emit each warning once, keyed by its stable id.
+        seen: set[str] = set()
         for rec in self._fetch_raw():
             ph = str(rec.get("phenomena", "")).upper()
             sig = str(rec.get("significance", "")).upper()
@@ -173,7 +231,14 @@ class IEMHistoricalSource(WarningSource):
             wfo = rec.get("wfo", "")
             etn = rec.get("etn", 0)
             states = sorted({u[:2] for u in rec.get("ugc", []) if len(u) >= 2})
-            wid = f"{rec.get('issued','')[:10]}-{wfo}-{ph}{sig}-{etn}"
+            # Normalise once so a cache written by an older build (compact IEM
+            # timestamps) self-heals, and the id's date prefix is consistent.
+            issued = _normalize_ts(rec["issued"])
+            expires = _normalize_ts(rec["expires"])
+            wid = f"{issued[:10]}-{wfo}-{ph}{sig}-{etn}"
+            if wid in seen:
+                continue
+            seen.add(wid)
             yield Warning(
                 id=wid,
                 event=event_name(ph, sig),
@@ -184,8 +249,8 @@ class IEMHistoricalSource(WarningSource):
                 ugc=rec.get("ugc", []),
                 states=states,
                 polygon=rec["geometry"],
-                issued=rec["issued"],
-                expires=rec["expires"],
+                issued=issued,
+                expires=expires,
             )
 
 
