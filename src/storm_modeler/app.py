@@ -55,138 +55,190 @@ def run_headless(args: argparse.Namespace) -> int:
 # GUI
 # ---------------------------------------------------------------------------
 
+def _fixture_dirs():
+    """Shipped fixture directories that contain a warning.json."""
+    return sorted(p for p in FIXTURE_DIR.iterdir() if (p / "warning.json").exists())
+
+
 def _build_window(persist: bool):
+    import threading
+
     from PySide6.QtCore import Qt, QThreadPool
-    from PySide6.QtWidgets import (
-        QFileDialog,
-        QInputDialog,
-        QMainWindow,
-        QSplitter,
-        QStatusBar,
-    )
+    from PySide6.QtWidgets import QMainWindow, QSplitter, QStatusBar
 
     from .data.sites import SiteResolver
     from .data.volumes import FixtureVolumeSource, NexradArchiveSource, bounded_window
-    from .data.warnings import FixtureWarningSource, IEMHistoricalSource
+    from .data.warnings import FixtureWarningSource
+    from .dialogs.download_dialog import DownloadDialog
+    from .dialogs.settings_dialog import SettingsDialog
+    from .panes.left_search import LeftSearchPane
+    from .panes.left_volumes import LeftVolumesPane
     from .panes.map_view import MapPane
     from .panes.model_view import ModelPane
-    from .panes.nav import NavPane
-    from .workers import WarningWorker
+    from .settings.resolver import resolve
+    from .workers import SearchWorker, WarningWorker
 
     class MainWindow(QMainWindow):
         def __init__(self) -> None:
             super().__init__()
             self.setWindowTitle("WxAlerts Storm Modeler — Phase A")
-            self.resize(1500, 900)
-
-            from .settings.resolver import resolve
+            self.resize(1600, 950)
 
             self.dsn = pg_dsn() if persist else None
-            self.params = resolve(self.dsn).detection
+            self.settings = resolve(self.dsn)
+            self.params = self.settings.detection
             self.resolver = SiteResolver()
             self.pool = QThreadPool.globalInstance()
             self._workers: list = []
+            self._sources: dict[str, object] = {}   # warning.id -> () -> VolumeSource
+            self._results: dict[str, list] = {}      # warning.id -> [VolumeResult]
+            self._selected_id: str | None = None
 
-            self.nav = NavPane()
+            # Panes.
+            self.search = LeftSearchPane(self.settings)
+            self.volumes = LeftVolumesPane()
             self.map = MapPane()
             self.model = ModelPane()
 
-            splitter = QSplitter(Qt.Horizontal)
-            splitter.addWidget(self.nav)
-            splitter.addWidget(self.map)
-            splitter.addWidget(self.model)
-            splitter.setStretchFactor(0, 0)
-            splitter.setStretchFactor(1, 1)
-            splitter.setStretchFactor(2, 0)
-            # Nav defaults to ~15% width, draggable.
-            splitter.setSizes([220, 940, 340])
-            self.setCentralWidget(splitter)
+            # Left panel: vertical split (search on top, volumes below).
+            left = QSplitter(Qt.Vertical)
+            left.addWidget(self.search)
+            left.addWidget(self.volumes)
+            left.setSizes([520, 420])
+
+            outer = QSplitter(Qt.Horizontal)
+            outer.addWidget(left)
+            outer.addWidget(self.map)
+            outer.addWidget(self.model)
+            outer.setStretchFactor(0, 0)
+            outer.setStretchFactor(1, 1)
+            outer.setStretchFactor(2, 0)
+            outer.setSizes([260, 960, 360])  # left ~15%, draggable
+            self.setCentralWidget(outer)
 
             self.setStatusBar(QStatusBar())
             self.map.set_basemap()
             self._build_menu()
 
-            self.nav.storm_selected.connect(self.map.highlight_cell)
-            self.nav.storm_selected.connect(
-                lambda c: self.statusBar().showMessage(
-                    f"Storm id {c.cell_id}  track {c.track_id}  "
-                    f"{c.max_dbz:.1f} dBZ  depth {c.depth_km:.1f} km"
-                )
-            )
+            # Wiring.
+            self.search.search_requested.connect(self.on_search)
+            self.search.warning_selected.connect(self.on_select)
+            self.search.download_requested.connect(self.on_download)
+            self.volumes.storm_selected.connect(self.map.highlight_cell)
+            self.volumes.storm_selected.connect(self._on_storm)
 
         # --- menu ---------------------------------------------------------
 
         def _build_menu(self) -> None:
             run_menu = self.menuBar().addMenu("&Run")
-            act_fix = run_menu.addAction("Replay fixture…")
-            act_fix.triggered.connect(self._pick_fixture)
-            act_range = run_menu.addAction("Run date range (IEM)…")
-            act_range.triggered.connect(self._pick_date_range)
+            run_menu.addAction("Load shipped fixtures").triggered.connect(self.load_fixtures)
             run_menu.addSeparator()
-            act_stop = run_menu.addAction("Stop")
-            act_stop.triggered.connect(self.stop)
+            run_menu.addAction("Stop").triggered.connect(self.stop)
+            settings_menu = self.menuBar().addMenu("&Settings")
+            settings_menu.addAction("Open settings…").triggered.connect(self.open_settings)
 
-        def _pick_fixture(self) -> None:
-            d = QFileDialog.getExistingDirectory(
-                self, "Choose replay fixture", str(FIXTURE_DIR)
+        def open_settings(self) -> None:
+            dlg = SettingsDialog(self.dsn, self)
+            dlg.settingsChanged.connect(self.reload_settings)
+            dlg.exec()
+
+        def reload_settings(self) -> None:
+            self.settings = resolve(self.dsn)
+            self.params = self.settings.detection
+            self.statusBar().showMessage(
+                f"Settings reloaded (detection hash {self.params.settings_hash})"
             )
-            if d:
-                self.start_replay(d)
 
-        def _pick_date_range(self) -> None:
-            text, ok = QInputDialog.getText(
-                self,
-                "IEM date range",
-                "UTC range  start,end  (e.g. 2024-05-25T17:00Z,2024-05-25T19:00Z):",
+        # --- search / results --------------------------------------------
+
+        def on_search(self, params) -> None:
+            self.search.clear_results()
+            self.search.set_searching(True)
+            worker = SearchWorker(params.start, params.end, params.states or None)
+            worker.signals.warning.connect(lambda w: self._add_result(w, params))
+            worker.signals.error.connect(
+                lambda m: self.statusBar().showMessage(f"IEM search failed: {m}")
             )
-            if ok and "," in text:
-                s, e = (t.strip() for t in text.split(",", 1))
-                self.start_live(s, e)
-
-        # --- runs ---------------------------------------------------------
-
-        def _submit(self, warning, volume_source, site) -> None:
-            worker = WarningWorker(
-                warning, volume_source, site, self.params, dsn=self.dsn
-            )
-            worker.signals.warning_started.connect(self.map.show_warning)
-            worker.signals.volume_done.connect(self._on_volume)
-            worker.signals.error.connect(self._on_error)
+            worker.signals.finished.connect(lambda: self.search.set_searching(False))
             self._workers.append(worker)
             self.pool.start(worker)
 
-        def start_replay(self, fixture_dir) -> None:
-            self.statusBar().showMessage(f"Replaying {fixture_dir}…")
-            for warning in FixtureWarningSource(fixture_dir):
-                site = self.resolver.for_polygon(warning.polygon)
-                self._submit(warning, FixtureVolumeSource(fixture_dir), site)
+        def _add_result(self, warning, params) -> None:
+            site = self.resolver.for_polygon(warning.polygon)
+            w0, w1 = bounded_window(
+                warning.issued, warning.expires, params.pre_minutes, params.post_minutes
+            )
+            self._sources[warning.id] = lambda: NexradArchiveSource(
+                site.icao, w0, w1, site.lat, site.lon,
+                h_km=self.params.grid_h_km, v_km=self.params.grid_v_km,
+            )
+            self.search.add_result(warning)
 
-        def start_live(self, start_iso: str, end_iso: str) -> None:
-            def _p(s: str) -> datetime:
-                return datetime.fromisoformat(
-                    s.replace("Z", "+00:00")
-                ).astimezone(timezone.utc)
+        def load_fixtures(self) -> None:
+            """Offline: populate results from the shipped replay fixtures."""
+            self.search.clear_results()
+            for d in _fixture_dirs():
+                for warning in FixtureWarningSource(d):
+                    self._sources[warning.id] = (lambda dd: (lambda: FixtureVolumeSource(dd)))(d)
+                    self.search.add_result(warning)
+            self.statusBar().showMessage("Loaded shipped fixtures.")
 
-            start, end = _p(start_iso), _p(end_iso)
-            self.statusBar().showMessage(f"Querying IEM {start_iso}…{end_iso}")
-            for warning in IEMHistoricalSource(start, end):
-                site = self.resolver.for_polygon(warning.polygon)
-                w0, w1 = bounded_window(warning.issued, warning.expires)
-                vs = NexradArchiveSource(site.icao, w0, w1, site.lat, site.lon)
-                self._submit(warning, vs, site)
+        def on_select(self, warning) -> None:
+            self._selected_id = warning.id
+            self.volumes.set_warning(warning)
+            self.map.show_warning(warning)
+            for res in self._results.get(warning.id, []):
+                self.volumes.add_result(res)
+            self.statusBar().showMessage(f"Selected {warning.event} ETN {warning.etn:04d}")
+
+        # --- download / processing ---------------------------------------
+
+        def on_download(self, warning) -> None:
+            factory = self._sources.get(warning.id)
+            if factory is None:
+                self.statusBar().showMessage("No volume source for that warning.")
+                return
+            site = self.resolver.for_polygon(warning.polygon)
+            self._selected_id = warning.id
+            self._results[warning.id] = []
+            self.volumes.set_warning(warning)
+            self.map.show_warning(warning)
+
+            cancel = threading.Event()
+            dialog = DownloadDialog(f"{site.icao}  {warning.event}", parent=self)
+            worker = WarningWorker(warning, factory(), site, self.params, self.dsn, cancel)
+            worker.signals.progress.connect(dialog.update_progress)
+            worker.signals.volume_done.connect(self._on_volume)
+            worker.signals.error.connect(self._on_error)
+            worker.signals.finished.connect(dialog.finish)
+            dialog.cancel_requested.connect(worker.request_cancel)
+            self._workers.append(worker)
+            self.pool.start(worker)
+            dialog.show()
 
         def stop(self) -> None:
+            for w in self._workers:
+                if hasattr(w, "request_cancel"):
+                    w.request_cancel()
             self.pool.clear()
-            self.statusBar().showMessage("Stopped (queued work cleared).")
+            self.statusBar().showMessage("Stopped (cancelled in-flight; queue cleared).")
 
         # --- signals ------------------------------------------------------
 
         def _on_volume(self, res) -> None:
-            self.nav.add_result(res)
-            self.map.show_result(res.warning, res.volume, res.cells)
+            self._results.setdefault(res.warning.id, []).append(res)
+            if res.warning.id == self._selected_id:
+                self.volumes.add_result(res)
+                self.map.show_result(res.warning, res.volume, res.cells)
             self.statusBar().showMessage(
                 f"{res.warning.event}  {res.volume.valid_time:%H%MZ}  "
-                f"{len(res.cells)} cell(s)"
+                f"{res.index}/{res.total}  {len(res.cells)} cell(s)"
+            )
+
+        def _on_storm(self, c) -> None:
+            self.statusBar().showMessage(
+                f"Storm id {c.cell_id}  track {c.track_id}  "
+                f"{c.max_dbz:.1f} dBZ  depth {c.depth_km:.1f} km"
             )
 
         def _on_error(self, msg: str) -> None:
@@ -203,9 +255,11 @@ def run_gui(args: argparse.Namespace) -> int:
     window = _build_window(persist=args.persist)
     window.show()
     if args.replay:
-        window.start_replay(args.replay)
+        window.load_fixtures()
     elif args.from_ and args.to:
-        window.start_live(args.from_, args.to)
+        window.search.start_edit.setText(args.from_)
+        window.search.end_edit.setText(args.to)
+        window.search._emit_search()
     return app.exec()
 
 
@@ -258,28 +312,38 @@ def run_smoke(args: argparse.Namespace) -> int:
     # No window.show() — VTK renders to its own GL window; the panes are fully
     # instantiated either way.
 
-    # Drive one fixture synchronously through the panes (no threads) so the
-    # smoke run is deterministic and self-contained.
     from .data.sites import SiteResolver
     from .data.volumes import FixtureVolumeSource
     from .data.warnings import FixtureWarningSource
+    from .dialogs.download_dialog import DownloadDialog
+    from .dialogs.settings_dialog import SettingsDialog
     from .pipeline import process_warning
 
+    # Populate results from the shipped fixtures, select the first, and drive it
+    # synchronously through every pane (no threads) so the run is deterministic.
+    window.load_fixtures()
     fixture = Path(args.replay) if args.replay else FIXTURE_DIR / "tornado_warning_case"
     resolver = SiteResolver()
     for warning in FixtureWarningSource(fixture):
+        window.on_select(warning)
         site = resolver.for_polygon(warning.polygon)
-        window.map.show_warning(warning)
         process_warning(
-            warning,
-            FixtureVolumeSource(fixture),
-            site,
-            window.params,
+            warning, FixtureVolumeSource(fixture), site, window.params,
             on_result=window._on_volume,
         )
 
+    # Instantiate the modal dialogs to prove they build (8B).
+    settings_dlg = SettingsDialog(window.dsn, window)
+    download_dlg = DownloadDialog("KFWS  Tornado Warning", total=9, parent=window)
+    download_dlg.update_progress(3, 9, "KFWS 1142Z")
+    assert window.search.results.count() >= 1
+    assert settings_dlg.model.rowCount() >= 1
+
     app.processEvents()
-    print("smoke: panes instantiated, fixture rendered — OK")
+    print(
+        "smoke: panes (search, volumes, map, model) + settings/download dialogs "
+        "instantiated, fixture rendered — OK"
+    )
     # The real smoke work is done. Reap the private Xvfb (if any) and hard-exit
     # 0: VTK/GL stacks can SIGABRT during interpreter teardown (a cosmetic
     # static-destructor race) which would otherwise flip the exit code.

@@ -33,6 +33,35 @@ class WorkerSignals(QObject):
     finished = Signal()
 
 
+class SearchSignals(QObject):
+    warning = Signal(object)  # Warning (one per admitted result)
+    error = Signal(str)
+    finished = Signal()
+
+
+class SearchWorker(QRunnable):
+    """Run an IEM historical query off the GUI thread, emitting each warning."""
+
+    def __init__(self, start, end, states=None) -> None:
+        super().__init__()
+        self.start = start
+        self.end = end
+        self.states = states
+        self.signals = SearchSignals()
+
+    @Slot()
+    def run(self) -> None:
+        from .data.warnings import IEMHistoricalSource
+
+        try:
+            for w in IEMHistoricalSource(self.start, self.end, self.states):
+                self.signals.warning.emit(w)
+        except Exception as e:  # noqa: BLE001
+            self.signals.error.emit(f"{type(e).__name__}: {e}")
+        finally:
+            self.signals.finished.emit()
+
+
 class WarningWorker(QRunnable):
     """Process a single warning's volumes off the GUI thread."""
 
