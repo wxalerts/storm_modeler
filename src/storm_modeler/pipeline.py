@@ -92,7 +92,11 @@ def process_warning(
             log.info("pipeline.cancelled", warning=warning.id, after=i - 1)
             break
         total = max(total, i)
+        log.info("pipeline.detect_begin", warning=warning.id, index=i, total=total,
+                 valid_time=volume.valid_time.isoformat(), shape=volume.shape)
         cells = scit_run(volume, params)
+        log.info("pipeline.detect_done", warning=warning.id, index=i,
+                 cells=len(cells))
         tracker.update(cells, volume.valid_time)
         res = VolumeResult(
             warning=warning, site=site, volume=volume, cells=cells,

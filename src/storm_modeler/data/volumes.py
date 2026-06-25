@@ -145,15 +145,23 @@ def grid_level2(
     -equidistant tangent plane centred on the radar so the result matches the
     :class:`GriddedVolume` contract SCIT consumes.
     """
+    import time
+
     import numpy as np
     import pyart  # type: ignore
 
+    t0 = time.perf_counter()
     radar = pyart.io.read_nexrad_archive(file_obj)
+    log.info("grid.read_done", site=site, nrays=int(radar.nrays),
+             nsweeps=int(radar.nsweeps), secs=round(time.perf_counter() - t0, 2))
 
     hw = grid.half_width_km * 1000.0
     nz, ny, nx = grid.nz(v_km), grid.nx(h_km), grid.nx(h_km)
     z_lim = (grid.z_min_km * 1000.0, grid.z_max_km * 1000.0)
 
+    log.info("grid.interp_begin", site=site, shape=(nz, ny, nx),
+             h_km=h_km, v_km=v_km)
+    t1 = time.perf_counter()
     gridded = pyart.map.grid_from_radars(
         (radar,),
         grid_shape=(nz, ny, nx),
@@ -161,6 +169,7 @@ def grid_level2(
         fields=["reflectivity"],
         weighting_function="Barnes2",
     )
+    log.info("grid.interp_done", site=site, secs=round(time.perf_counter() - t1, 2))
     refl = np.ma.filled(
         gridded.fields["reflectivity"]["data"], np.nan
     ).astype(np.float32)
@@ -276,6 +285,7 @@ class ThreddsLevel2Source(VolumeSource):
 
     def volumes(self) -> Iterator[GriddedVolume]:
         import io
+        import time
 
         import httpx  # type: ignore
 
@@ -283,15 +293,25 @@ class ThreddsLevel2Source(VolumeSource):
         log.info("thredds.window", site=self.site, n=len(keys),
                  start=self.start.isoformat(), end=self.end.isoformat())
         with httpx.Client(timeout=180, follow_redirects=True) as client:
-            for t, path in keys:
+            for i, (t, path) in enumerate(keys, 1):
                 url = f"{THREDDS_FILESERVER}/{path}"
-                log.info("thredds.read", url=url, valid_time=t.isoformat())
+                log.info("thredds.download_begin", index=i, total=len(keys),
+                         valid_time=t.isoformat(), file=path.rsplit("/", 1)[-1])
+                t0 = time.perf_counter()
                 resp = client.get(url)
                 resp.raise_for_status()
+                mb = len(resp.content) / 1e6
+                log.info("thredds.download_done", index=i, total=len(keys),
+                         mb=round(mb, 2), secs=round(time.perf_counter() - t0, 2))
+                log.info("thredds.grid_begin", index=i, total=len(keys))
+                t1 = time.perf_counter()
                 vol = grid_level2(
                     io.BytesIO(resp.content), self.site, self.lat0, self.lon0,
                     self.grid, self.h_km, self.v_km,
                 )
+                log.info("thredds.grid_done", index=i, total=len(keys),
+                         valid_time=vol.valid_time.isoformat(),
+                         secs=round(time.perf_counter() - t1, 2))
                 yield vol
 
 

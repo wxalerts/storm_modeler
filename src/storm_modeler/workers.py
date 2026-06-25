@@ -13,6 +13,7 @@ from __future__ import annotations
 import threading
 import traceback
 
+import structlog
 from PySide6.QtCore import QObject, QRunnable, Signal, Slot
 
 from .data.sites import Site
@@ -20,6 +21,8 @@ from .data.volumes import VolumeSource
 from .models import Warning
 from .pipeline import VolumeResult, process_warning
 from .settings.resolver import DetectionParams
+
+log = structlog.get_logger(__name__)
 
 
 class WorkerSignals(QObject):
@@ -92,6 +95,8 @@ class WarningWorker(QRunnable):
     @Slot()
     def run(self) -> None:  # noqa: D401 - QRunnable entry point
         persistence = None
+        log.info("worker.run_begin", warning=self.warning.id, site=self.site.icao,
+                 thread=threading.get_ident())
         try:
             if self.dsn:
                 from .persist import Persistence
@@ -108,6 +113,8 @@ class WarningWorker(QRunnable):
                         self.warning.id, self.warning.event, res.cells,
                         self.params.settings_hash,
                     )
+                log.info("worker.emit_volume", warning=self.warning.id,
+                         index=res.index, total=res.total, cells=len(res.cells))
                 self.signals.volume_done.emit(res)
 
             def on_progress(i: int, total: int, volume) -> None:
@@ -118,8 +125,10 @@ class WarningWorker(QRunnable):
                 self.warning, self.volume_source, self.site, self.params,
                 on_result=on_result, on_progress=on_progress, cancel=self.cancel,
             )
+            log.info("worker.run_done", warning=self.warning.id)
             self.signals.warning_done.emit(self.warning)
         except Exception as e:  # noqa: BLE001
+            log.error("worker.run_error", warning=self.warning.id, error=str(e))
             self.signals.error.emit(f"{e}\n{traceback.format_exc()}")
         finally:
             if persistence is not None:
