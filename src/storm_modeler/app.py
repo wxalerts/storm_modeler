@@ -225,17 +225,35 @@ def _build_window(persist: bool):
             # thread before the worker grids — importing it on the worker
             # segfaults in pyproj's non-thread-safe CRS init.
             warmup_grid_stack()
+
+            # Detection + tracking + persistence run on the GUI thread (pyproj
+            # is unsafe to use on the QThreadPool worker); the worker only grids.
+            from .detection.detection_v2 import Tracker
+            self._dl_tracker = Tracker(self.params)
+            self._dl_persistence = None
+            if self.dsn:
+                from .persist import Persistence
+                self._dl_persistence = Persistence(self.dsn)
+                self._dl_persistence.connect()
+                self._dl_persistence.upsert_warning(warning)
+
             cancel = threading.Event()
             dialog = DownloadDialog(f"{site.icao}  {warning.event}", parent=self)
             worker = WarningWorker(warning, factory(), site, self.params, self.dsn, cancel)
             worker.signals.progress.connect(dialog.update_progress)
-            worker.signals.volume_done.connect(self._on_volume)
+            worker.signals.volume_gridded.connect(self._on_gridded)
             worker.signals.error.connect(self._on_error)
             worker.signals.finished.connect(dialog.finish)
+            worker.signals.finished.connect(self._close_download_persistence)
             dialog.cancel_requested.connect(worker.request_cancel)
             self._workers.append(worker)
             self.pool.start(worker)
             dialog.show()
+
+        def _close_download_persistence(self) -> None:
+            if getattr(self, "_dl_persistence", None) is not None:
+                self._dl_persistence.close()
+                self._dl_persistence = None
 
         def stop(self) -> None:
             for w in self._workers:
@@ -245,6 +263,41 @@ def _build_window(persist: bool):
             self.statusBar().showMessage("Stopped (cancelled in-flight; queue cleared).")
 
         # --- signals ------------------------------------------------------
+
+        def _on_gridded(self, warning, volume, index, total) -> None:
+            """GUI-thread SCIT detection + tracking on a freshly gridded volume.
+
+            Runs here (not on the worker) because SCIT builds pyproj transformers
+            and doing that on the QThreadPool worker segfaults in PROJ.
+            """
+            from .detection.detection_v2 import run as scit_run
+            from .pipeline import VolumeResult
+
+            log.info("gui.detect_begin", warning=warning.id, index=index, total=total,
+                     valid_time=volume.valid_time.isoformat())
+            try:
+                cells = scit_run(volume, self.params)
+                self._dl_tracker.update(cells, volume.valid_time)
+            except Exception as e:  # noqa: BLE001
+                log.error("gui.detect_error", warning=warning.id, index=index,
+                          error=str(e))
+                return
+            log.info("gui.detect_done", warning=warning.id, index=index,
+                     cells=len(cells))
+
+            site = self.resolver.for_polygon(warning.polygon)
+            res = VolumeResult(
+                warning=warning, site=site, volume=volume, cells=cells,
+                index=index, total=total, settings_hash=self.params.settings_hash,
+            )
+            if getattr(self, "_dl_persistence", None) is not None:
+                try:
+                    self._dl_persistence.upsert_cells(
+                        warning.id, warning.event, cells, self.params.settings_hash
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.error("gui.persist_error", warning=warning.id, error=str(e))
+            self._on_volume(res)
 
         def _on_volume(self, res) -> None:
             self._results.setdefault(res.warning.id, []).append(res)

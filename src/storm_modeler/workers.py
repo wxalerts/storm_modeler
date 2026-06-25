@@ -19,7 +19,6 @@ from PySide6.QtCore import QObject, QRunnable, Signal, Slot
 from .data.sites import Site
 from .data.volumes import VolumeSource
 from .models import Warning
-from .pipeline import VolumeResult, process_warning
 from .settings.resolver import DetectionParams
 
 log = structlog.get_logger(__name__)
@@ -28,7 +27,10 @@ log = structlog.get_logger(__name__)
 class WorkerSignals(QObject):
     """Signals emitted from a worker thread back to the GUI thread."""
 
-    volume_done = Signal(object)  # VolumeResult
+    # (warning, GriddedVolume, index, total) — the worker only downloads + grids;
+    # SCIT detection runs on the GUI thread (it creates pyproj transformers, and
+    # building those on a QThreadPool worker segfaults in PROJ — see app._on_gridded).
+    volume_gridded = Signal(object, object, int, int)
     progress = Signal(int, int, str)  # index, total, label (e.g. "KFWS 1142Z")
     warning_started = Signal(object)  # Warning
     warning_done = Signal(object)  # Warning
@@ -69,7 +71,14 @@ class SearchWorker(QRunnable):
 
 
 class WarningWorker(QRunnable):
-    """Process a single warning's volumes off the GUI thread."""
+    """Download + grid a warning's volumes off the GUI thread.
+
+    Detection is **not** run here: it builds pyproj transformers, and creating
+    those on a ``QThreadPool`` worker segfaults in PROJ on some stacks. The
+    worker only does the slow, pyproj-free-for-our-code work (HTTP + Py-ART
+    gridding) and hands each raw :class:`GriddedVolume` to the GUI thread, which
+    runs SCIT + tracking + persistence (see :meth:`MainWindow._on_gridded`).
+    """
 
     def __init__(
         self,
@@ -94,43 +103,31 @@ class WarningWorker(QRunnable):
 
     @Slot()
     def run(self) -> None:  # noqa: D401 - QRunnable entry point
-        persistence = None
         log.info("worker.run_begin", warning=self.warning.id, site=self.site.icao,
                  thread=threading.get_ident())
         try:
-            if self.dsn:
-                from .persist import Persistence
-
-                persistence = Persistence(self.dsn)
-                persistence.connect()
-                persistence.upsert_warning(self.warning)
-
             self.signals.warning_started.emit(self.warning)
+            total = 0
+            try:
+                total = int(self.volume_source.estimated_count())
+            except Exception:  # noqa: BLE001 - estimate is best-effort
+                total = 0
 
-            def on_result(res: VolumeResult) -> None:
-                if persistence is not None:
-                    persistence.upsert_cells(
-                        self.warning.id, self.warning.event, res.cells,
-                        self.params.settings_hash,
-                    )
-                log.info("worker.emit_volume", warning=self.warning.id,
-                         index=res.index, total=res.total, cells=len(res.cells))
-                self.signals.volume_done.emit(res)
-
-            def on_progress(i: int, total: int, volume) -> None:
+            for i, volume in enumerate(self.volume_source, 1):
+                if self.cancel.is_set():
+                    log.info("worker.cancelled", warning=self.warning.id, after=i - 1)
+                    break
+                total = max(total, i)
                 label = f"{self.site.icao} {volume.valid_time:%H%MZ}"
                 self.signals.progress.emit(i, total, label)
+                log.info("worker.emit_gridded", warning=self.warning.id, index=i,
+                         total=total, valid_time=volume.valid_time.isoformat())
+                self.signals.volume_gridded.emit(self.warning, volume, i, total)
 
-            process_warning(
-                self.warning, self.volume_source, self.site, self.params,
-                on_result=on_result, on_progress=on_progress, cancel=self.cancel,
-            )
             log.info("worker.run_done", warning=self.warning.id)
             self.signals.warning_done.emit(self.warning)
         except Exception as e:  # noqa: BLE001
             log.error("worker.run_error", warning=self.warning.id, error=str(e))
             self.signals.error.emit(f"{e}\n{traceback.format_exc()}")
         finally:
-            if persistence is not None:
-                persistence.close()
             self.signals.finished.emit()
