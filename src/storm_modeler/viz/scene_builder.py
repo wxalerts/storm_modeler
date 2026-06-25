@@ -23,7 +23,7 @@ from pyproj import Transformer
 
 from ..data.radar_render import NWS_DBZ_TABLE
 from ..detection.detection_v2 import StormCell
-from ..models import GriddedVolume
+from ..models import PROJ_LOCK, GriddedVolume
 from ..settings.resolver import ViewerParams
 
 log = structlog.get_logger(__name__)
@@ -86,8 +86,11 @@ def _lonlat_to_km(volume: GriddedVolume, lon, lat):
         f"+proj=aeqd +lat_0={volume.lat0} +lon_0={volume.lon0} "
         "+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
     )
-    fwd = Transformer.from_crs("EPSG:4326", aeqd, always_xy=True)
-    xm, ym = fwd.transform(np.asarray(lon), np.asarray(lat))
+    # Share the global PROJ lock: this runs on the GUI thread while a download
+    # worker may be transforming concurrently (see models.PROJ_LOCK).
+    with PROJ_LOCK:
+        fwd = Transformer.from_crs("EPSG:4326", aeqd, always_xy=True)
+        xm, ym = fwd.transform(np.asarray(lon), np.asarray(lat))
     return np.asarray(xm) / 1000.0, np.asarray(ym) / 1000.0
 
 

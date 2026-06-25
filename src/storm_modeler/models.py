@@ -8,6 +8,7 @@ gridding), and the storm cells SCIT emits live in ``detection.detection_v2``.
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,15 @@ from pathlib import Path
 import numpy as np
 from pyproj import Transformer
 from shapely.geometry import Polygon, mapping, shape
+
+#: Serialises every pyproj/PROJ operation across threads. PROJ context creation
+#: is not concurrency-safe, and during a live download two threads use pyproj at
+#: once — the worker detecting a volume (StormCell seed lon/lat) while the GUI
+#: thread renders the previous volume's radar/cells. Doing both at the same
+#: instant intermittently segfaults in PROJ, so all transforms take this lock.
+#: Anything that builds a pyproj Transformer (scene/cross-section too) must use
+#: it. The work under the lock is microseconds, so contention is negligible.
+PROJ_LOCK = threading.Lock()
 
 
 def _parse_dt(value) -> datetime:
@@ -144,7 +154,8 @@ class GriddedVolume:
         return Transformer.from_crs(aeqd, "EPSG:4326", always_xy=True)
 
     def xy_to_lonlat(self, xm: np.ndarray, ym: np.ndarray):
-        lon, lat = self.transformer_to_lonlat().transform(xm, ym)
+        with PROJ_LOCK:
+            lon, lat = self.transformer_to_lonlat().transform(xm, ym)
         return lon, lat
 
     def composite_reflectivity(self) -> np.ndarray:
