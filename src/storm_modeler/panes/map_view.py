@@ -76,7 +76,7 @@ class MapPane(QWidget):
 
         self._radar_actor = None
         self._warning_actor = None
-        self._cell_actors: dict[int, object] = {}
+        self._cell_actors: list = []
         self._highlight_actor = None
         self._extent: tuple[float, float, float, float] | None = None
 
@@ -120,18 +120,43 @@ class MapPane(QWidget):
             mesh = _polygon_to_lines(c.envelope, z=0.03)
             actor = self._safe_add(mesh, color=(1.0, 1.0, 0.0), line_width=2.0)
             if actor is not None:
-                self._cell_actors[c.track_id] = actor
+                self._cell_actors.append(actor)
+
+    def _clear_cells(self) -> None:
+        for actor in self._cell_actors:
+            self._safe_remove(actor)
+        self._cell_actors.clear()
 
     def show_result(self, warning: Warning, volume: GriddedVolume, cells) -> None:
         log.info("map.show_result.begin", valid_time=volume.valid_time.isoformat(),
                  n_cells=len(list(cells)), allow_render=self._allow_render)
         self.show_warning(warning)
         self.set_radar(volume)
+        self._clear_cells()
         self.add_cells(list(cells))
         self.fit_view()
         log.info("map.show_result.done", valid_time=volume.valid_time.isoformat())
 
     # --- interaction ------------------------------------------------------
+
+    def show_cell_selection(
+        self, warning: Warning, volume: GriddedVolume, cells, cell: StormCell
+    ) -> None:
+        """Switch the map to a selected cell's volume.
+
+        Swaps the radar layer to that volume's reflectivity, redraws that
+        volume's cell envelopes, then highlights and recenters on the chosen
+        cell. This is what makes the map track the volume you click in the
+        navigator (the radar previously stayed on the last downloaded volume).
+        """
+        log.info("map.select_cell.begin", valid_time=volume.valid_time.isoformat(),
+                 cell_id=cell.cell_id, allow_render=self._allow_render)
+        self.show_warning(warning)
+        self.set_radar(volume)
+        self._clear_cells()
+        self.add_cells(list(cells))
+        self.highlight_cell(cell)
+        log.info("map.select_cell.done", valid_time=volume.valid_time.isoformat())
 
     def highlight_cell(self, cell: StormCell) -> None:
         """Recenter on a cell and draw a bold highlight on its envelope."""

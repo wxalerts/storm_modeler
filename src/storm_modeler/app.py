@@ -130,7 +130,9 @@ def _build_window(persist: bool):
             self.search.search_requested.connect(self.on_search)
             self.search.warning_selected.connect(self.on_select)
             self.search.download_requested.connect(self.on_download)
-            self.volumes.storm_selected.connect(self.map.highlight_cell)
+            # _on_storm drives both the map (radar/cells for the cell's volume)
+            # and the 3D pane; it falls back to a plain highlight if the volume
+            # isn't found.
             self.volumes.storm_selected.connect(self._on_storm)
 
         # --- menu ---------------------------------------------------------
@@ -320,7 +322,17 @@ def _build_window(persist: bool):
             results = self._results.get(self._selected_id, [])
             factory = self._sources.get(self._selected_id)
             log.info("gui.storm_selected", cell_id=c.cell_id, track_id=c.track_id,
-                     max_dbz=round(c.max_dbz, 1), n_volumes=len(results))
+                     max_dbz=round(c.max_dbz, 1), valid_time=c.valid_time.isoformat(),
+                     n_volumes=len(results))
+            # Map: switch the radar layer to this cell's volume, not the last
+            # one downloaded. Match by valid_time; fall back to a plain highlight.
+            match = next(
+                (r for r in results if r.volume.valid_time == c.valid_time), None
+            )
+            if match is not None:
+                self.map.show_cell_selection(match.warning, match.volume, match.cells, c)
+            else:
+                self.map.highlight_cell(c)
             self.model.show_cell(c, results, source_factory=factory)
             self.statusBar().showMessage(
                 f"Storm id {c.cell_id}  track {c.track_id}  "
