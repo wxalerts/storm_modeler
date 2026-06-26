@@ -68,7 +68,12 @@ def radar_polydata(volume: GriddedVolume, z: float = 0.0):
 
     comp = volume.composite_reflectivity()  # (ny, nx)
     ny, nx = comp.shape
-    xx, yy = np.meshgrid(volume.x, volume.y)  # metres
+    xx, yy = np.meshgrid(volume.x, volume.y)  # metres east/north of the radar
+    # Radar coverage is a disc centred on the site, not the square analysis grid.
+    # Blank everything beyond the largest circle the grid fully contains so the
+    # display reads as a NEXRAD range ring rather than a filled box.
+    rmax = min(volume.x.max(), -volume.x.min(), volume.y.max(), -volume.y.min())
+    comp = np.where(np.hypot(xx, yy) <= rmax, comp, np.nan)
     lon, lat = volume.xy_to_lonlat(xx.ravel(), yy.ravel())
     lon = np.asarray(lon).reshape(ny, nx)
     lat = np.asarray(lat).reshape(ny, nx)
