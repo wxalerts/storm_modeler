@@ -130,6 +130,7 @@ def _build_window(persist: bool):
             self.search.search_requested.connect(self.on_search)
             self.search.warning_selected.connect(self.on_select)
             self.search.download_requested.connect(self.on_download)
+            self.search.downloaded_selected.connect(self.on_select)
             # _on_storm drives both the map (radar/cells for the cell's volume)
             # and the 3D pane; it falls back to a plain highlight if the volume
             # isn't found.
@@ -247,6 +248,8 @@ def _build_window(persist: bool):
             worker.signals.error.connect(self._on_error)
             worker.signals.finished.connect(dialog.finish)
             worker.signals.finished.connect(self._close_download_persistence)
+            # Record it in the session "Downloaded" list once volumes are in.
+            worker.signals.warning_done.connect(self.search.add_downloaded)
             dialog.cancel_requested.connect(worker.request_cancel)
             self._workers.append(worker)
             self.pool.start(worker)

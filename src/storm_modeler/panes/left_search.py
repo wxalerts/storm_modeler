@@ -16,6 +16,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -70,6 +71,7 @@ class LeftSearchPane(QWidget):
     search_requested = Signal(object)      # SearchParams
     download_requested = Signal(object)    # Warning
     warning_selected = Signal(object)      # Warning
+    downloaded_selected = Signal(object)   # Warning (a previously-downloaded one)
 
     def __init__(self, settings: ResolvedSettings | None = None, parent=None) -> None:
         super().__init__(parent)
@@ -124,10 +126,24 @@ class LeftSearchPane(QWidget):
         self.progress.setVisible(False)
         root.addWidget(self.progress)
 
-        root.addWidget(QLabel("Results"))
+        root.addWidget(QLabel("Search results"))
         self.results = QListWidget()
         self.results.currentRowChanged.connect(self._on_row)
-        root.addWidget(self.results, 1)
+        root.addWidget(self.results, 2)
+
+        # Below an HR: warnings already downloaded this session. Selecting one
+        # re-shows its volumes without re-downloading. (Volumes live in memory;
+        # they are not yet cached to disk across restarts.)
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        root.addWidget(line)
+        self.downloaded_label = QLabel("Downloaded (this session)")
+        root.addWidget(self.downloaded_label)
+        self.downloaded = QListWidget()
+        self.downloaded.currentRowChanged.connect(self._on_downloaded_row)
+        root.addWidget(self.downloaded, 1)
+        self._downloaded_warnings: list[Warning] = []
 
     # --- search -----------------------------------------------------------
 
@@ -173,3 +189,22 @@ class LeftSearchPane(QWidget):
     def _on_row(self, row: int) -> None:
         if 0 <= row < len(self._warnings):
             self.warning_selected.emit(self._warnings[row])
+
+    # --- downloaded (session) list ---------------------------------------
+
+    def add_downloaded(self, warning: Warning) -> None:
+        """Record a downloaded warning in the session list (idempotent)."""
+        if any(w.id == warning.id for w in self._downloaded_warnings):
+            return
+        self._downloaded_warnings.append(warning)
+        states = ",".join(warning.states)
+        text = (
+            f"{warning.event} · {warning.wfo} · ETN {warning.etn:04d} · "
+            f"{_z(warning.issued)}–{_z(warning.expires)}"
+            + (f" · {states}" if states else "")
+        )
+        self.downloaded.addItem(QListWidgetItem(text))
+
+    def _on_downloaded_row(self, row: int) -> None:
+        if 0 <= row < len(self._downloaded_warnings):
+            self.downloaded_selected.emit(self._downloaded_warnings[row])
