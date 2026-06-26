@@ -134,8 +134,23 @@ class MapPane(QWidget):
         self.set_radar(volume)
         self._clear_cells()
         self.add_cells(list(cells))
-        self.fit_view()
+        # Frame the warning (the storm of interest), not the whole radar disc —
+        # the chosen radar can be 100+ km away, leaving the warning at the edge.
+        self.fit_to_warning(warning)
         log.info("map.show_result.done", valid_time=volume.valid_time.isoformat())
+
+    def fit_to_warning(self, warning: Warning) -> None:
+        """Center and zoom the camera on the warning polygon (+ context margin)."""
+        try:
+            lon0, lat0, lon1, lat1 = warning.polygon.bounds
+            cx, cy = (lon0 + lon1) / 2.0, (lat0 + lat1) / 2.0
+            # Half-height of the viewport: the larger warning dimension plus a
+            # margin so nearby radar echoes around the storm stay in frame.
+            half = max(lon1 - lon0, lat1 - lat0, 0.4) * 0.9 + 0.25
+            self.recenter(cx, cy, span_deg=half)
+        except Exception as e:  # noqa: BLE001
+            log.info("map.fit_warning_skipped", reason=str(e).splitlines()[0])
+            self.fit_view()
 
     # --- interaction ------------------------------------------------------
 
