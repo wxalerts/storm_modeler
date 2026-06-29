@@ -16,8 +16,10 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from pathlib import Path
+
 from .registry import DETECTION_KEYS, defaults
-from .store import SettingsStore
+from .store import open_store
 
 
 @dataclass(frozen=True)
@@ -33,7 +35,8 @@ class DetectionParams:
     min_area_km2: float = 4.0
     grid_h_km: float = 1.0
     grid_v_km: float = 0.5
-    watershed_split: bool = False
+    watershed_split: bool = True
+    watershed_min_sep_km: float = 14.0
     track_max_km: float = 12.0
     track_miss_max: int = 2
 
@@ -125,15 +128,24 @@ class ViewerParams:
         )
 
 
-def resolve(dsn: str | None = None) -> ResolvedSettings:
-    """Resolve registry defaults ⊕ DB overrides. DB-less callers get defaults."""
+def resolve(
+    dsn: str | None = None, local_path: str | Path | None = None
+) -> ResolvedSettings:
+    """Resolve registry defaults ⊕ overrides.
+
+    Overrides come from PostGIS when ``dsn`` is given, else from a local JSON
+    file when ``local_path`` is given, else nothing (pure registry defaults, as
+    offline tests expect).
+    """
     merged = defaults()
-    try:
-        with SettingsStore(dsn) as store:
-            merged.update(store.overrides())
-    except RuntimeError:
-        # No PG_DSN — fall back to pure registry defaults (e.g. offline tests).
-        pass
+    store = open_store(dsn, local_path)
+    if store is not None:
+        try:
+            with store as s:
+                merged.update(s.overrides())
+        except RuntimeError:
+            # No PG_DSN — fall back to pure registry defaults.
+            pass
     return ResolvedSettings(values=merged)
 
 

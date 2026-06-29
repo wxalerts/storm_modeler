@@ -32,6 +32,17 @@ def pg_dsn() -> str | None:
     return os.environ.get("PG_DSN") or None
 
 
+def local_settings_path() -> Path:
+    """On-disk settings file used to persist overrides when no ``PG_DSN`` is set.
+
+    A JSON fallback for the PostGIS ``app_settings`` table, so the desktop app
+    keeps tuning across restarts without a database. Overridable via
+    ``STORM_MODELER_SETTINGS``.
+    """
+    env = os.environ.get("STORM_MODELER_SETTINGS")
+    return Path(env) if env else CACHE_DIR / "settings.json"
+
+
 # --- Source filter (Section 1a) --------------------------------------------
 
 #: VTEC phenomena admitted by the historical source. Everything else dropped.

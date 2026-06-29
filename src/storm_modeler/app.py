@@ -20,7 +20,7 @@ from pathlib import Path
 
 import structlog
 
-from .config import pg_dsn
+from .config import local_settings_path, pg_dsn
 
 log = structlog.get_logger(__name__)
 
@@ -82,7 +82,13 @@ def _build_window(persist: bool):
             self.resize(1600, 950)
 
             self.dsn = pg_dsn() if persist else None
-            self.settings = resolve(self.dsn)
+            # No database? Persist tuning to a local JSON file instead, so the
+            # Settings dialog survives restarts. (persist=False keeps the smoke
+            # test pure: no DSN, no file.)
+            self.settings_path = (
+                local_settings_path() if (persist and not self.dsn) else None
+            )
+            self.settings = resolve(self.dsn, self.settings_path)
             self.params = self.settings.detection
             self.resolver = SiteResolver()
             self.pool = QThreadPool.globalInstance()
@@ -247,12 +253,12 @@ def _build_window(persist: bool):
             super().closeEvent(event)
 
         def open_settings(self) -> None:
-            dlg = SettingsDialog(self.dsn, self)
+            dlg = SettingsDialog(self.dsn, self.settings_path, self)
             dlg.settingsChanged.connect(self.reload_settings)
             dlg.exec()
 
         def reload_settings(self) -> None:
-            self.settings = resolve(self.dsn)
+            self.settings = resolve(self.dsn, self.settings_path)
             self.params = self.settings.detection
             self.model.set_settings(self.settings)
             self.statusBar().showMessage(
@@ -616,7 +622,7 @@ def run_smoke(args: argparse.Namespace) -> int:
         )
 
     # Instantiate the modal dialogs to prove they build (8B).
-    settings_dlg = SettingsDialog(window.dsn, window)
+    settings_dlg = SettingsDialog(window.dsn, window.settings_path, window)
     download_dlg = DownloadDialog("KFWS  Tornado Warning", total=9, parent=window)
     download_dlg.update_progress(3, 9, "KFWS 1142Z")
     assert window.search.results.count() >= 1

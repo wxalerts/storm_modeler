@@ -77,11 +77,21 @@ def identify(volume: GriddedVolume, params: DetectionParams | None = None) -> li
 
     # Optional watershed split of merged seed blobs by per-column peak markers.
     if params.watershed_split and n >= 1:
-        labels, n = _watershed_split(filled, seed_mask, labels)
+        # Peak separation is a physical distance; convert to grid cells.
+        min_sep_px = max(1, int(round(params.watershed_min_sep_km / volume.dx_km)))
+        labels, n = _watershed_split(filled, seed_mask, labels, min_sep_px)
 
-    # Connected-component labels of the base footprint, to grow each seed to its
-    # base extent.
-    base_labels, _ = ndimage.label(base_mask2d)
+    # Footprint assignment. Without splitting, each seed grows to the whole
+    # base-reflectivity component that contains it. With splitting on, that one
+    # base component is partitioned among the seeds (a 2D watershed keyed by each
+    # seed's column footprint), so a merged multi-core system resolves into
+    # disjoint cells rather than N copies of the same whole-system envelope.
+    if params.watershed_split and n >= 1:
+        foot_labels = _partition_footprint(filled, labels, base_mask2d, n)
+        base_labels = None
+    else:
+        foot_labels = None
+        base_labels, _ = ndimage.label(base_mask2d)
 
     candidates: list[StormCell] = []
     for lab in range(1, n + 1):
@@ -90,14 +100,19 @@ def identify(volume: GriddedVolume, params: DetectionParams | None = None) -> li
         n_levels = int(np.unique(zc).size)
 
         seed_foot = region.any(axis=0)  # (ny, nx)
-        # Grow to the base-reflectivity footprint that contains this seed.
-        overlap = base_labels[seed_foot]
-        overlap = overlap[overlap > 0]
-        if overlap.size:
-            base_id = np.bincount(overlap).argmax()
-            foot = base_labels == base_id
+        if foot_labels is not None:
+            foot = foot_labels == lab
+            if not foot.any():  # seed claimed no base pixels — fall back to itself
+                foot = seed_foot
         else:
-            foot = seed_foot
+            # Grow to the base-reflectivity footprint that contains this seed.
+            overlap = base_labels[seed_foot]
+            overlap = overlap[overlap > 0]
+            if overlap.size:
+                base_id = np.bincount(overlap).argmax()
+                foot = base_labels == base_id
+            else:
+                foot = seed_foot
 
         ys_foot, xs_foot = np.nonzero(foot)
         area_km2 = float(ys_foot.size) * cell_area_km2
@@ -158,15 +173,44 @@ def identify(volume: GriddedVolume, params: DetectionParams | None = None) -> li
     return candidates
 
 
-def _watershed_split(filled: np.ndarray, seed_mask: np.ndarray, labels: np.ndarray):
-    """Split merged seed components at reflectivity saddles (skimage watershed)."""
+def _partition_footprint(
+    filled: np.ndarray, labels: np.ndarray, base_mask2d: np.ndarray, n: int
+) -> np.ndarray:
+    """Partition the base footprint among the seeds (2D watershed by seed column).
+
+    Each base-threshold pixel is assigned to the seed it descends to along the
+    column-max reflectivity surface, so a merged multi-core system resolves into
+    disjoint cell footprints instead of N copies of the whole-system envelope.
+    Returns a 2D label image (0 = unclaimed; seed label otherwise).
+    """
+    from skimage.segmentation import watershed
+
+    colmax = filled.max(axis=0)  # (ny, nx) column-max reflectivity
+    markers = np.zeros(base_mask2d.shape, dtype=np.int32)
+    for lab in range(1, n + 1):
+        markers[(labels == lab).any(axis=0)] = lab
+    markers[~base_mask2d] = 0  # seeds sit at >= seed_dbz, so always within base
+    return watershed(-colmax, markers=markers, mask=base_mask2d)
+
+
+def _watershed_split(
+    filled: np.ndarray,
+    seed_mask: np.ndarray,
+    labels: np.ndarray,
+    min_distance: int = 3,
+):
+    """Split merged seed components at reflectivity saddles (skimage watershed).
+
+    ``min_distance`` is the minimum peak separation in grid cells: larger values
+    merge nearby cores, yielding fewer cells.
+    """
     from scipy import ndimage as ndi
     from skimage.feature import peak_local_max
     from skimage.segmentation import watershed
 
     # Markers: local reflectivity maxima within the seed mask.
     coords = peak_local_max(
-        np.where(seed_mask, filled, 0.0), min_distance=3, labels=labels
+        np.where(seed_mask, filled, 0.0), min_distance=min_distance, labels=labels
     )
     if coords.shape[0] == 0:
         return labels, int(labels.max())

@@ -8,11 +8,12 @@ the registry default at resolve time.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import structlog
 
-from ..config import pg_dsn
+from ..config import local_settings_path, pg_dsn
 from .registry import get_spec
 
 log = structlog.get_logger(__name__)
@@ -100,3 +101,79 @@ class SettingsStore:
         with self._conn.cursor() as cur:
             cur.execute("DELETE FROM app_settings WHERE key = %s", (key,))
         self._conn.commit()
+
+
+class LocalSettingsStore:
+    """File-backed overrides — the no-database fallback for ``SettingsStore``.
+
+    Persists overrides to a JSON file so the desktop app keeps its tuning across
+    restarts without PostGIS. Mirrors the ``SettingsStore`` interface
+    (``overrides`` / ``set`` / ``set_many`` / ``unset``, context-manager friendly)
+    so callers are storage-agnostic.
+    """
+
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.path = Path(path) if path else local_settings_path()
+        self._data: dict[str, Any] | None = None
+
+    def __enter__(self) -> "LocalSettingsStore":
+        self._data = self._read()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._data = None
+
+    def _read(self) -> dict[str, Any]:
+        try:
+            raw = json.loads(self.path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _write(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self._data, indent=2, sort_keys=True))
+
+    def overrides(self) -> dict[str, Any]:
+        data = self._data if self._data is not None else self._read()
+        out: dict[str, Any] = {}
+        for key, value in data.items():
+            try:
+                out[key] = get_spec(key).validate(value)
+            except (KeyError, ValueError) as e:  # noqa: PERF203
+                log.warning("settings.skip_override", key=key, reason=str(e))
+        return out
+
+    def set(self, key: str, value: Any) -> Any:
+        return self.set_many({key: value})[key]
+
+    def set_many(self, items: dict[str, Any]) -> dict[str, Any]:
+        if self._data is None:
+            self._data = self._read()
+        cleaned: dict[str, Any] = {}
+        for key, value in items.items():
+            cleaned[key] = get_spec(key).validate(value)
+            self._data[key] = cleaned[key]
+        self._write()
+        log.info("settings.set_local", keys=list(cleaned), path=str(self.path))
+        return cleaned
+
+    def unset(self, key: str) -> None:
+        if self._data is None:
+            self._data = self._read()
+        self._data.pop(key, None)
+        self._write()
+
+
+def open_store(
+    dsn: str | None = None, local_path: str | Path | None = None
+) -> "SettingsStore | LocalSettingsStore | None":
+    """Pick a settings store: PostGIS if a DSN is given, else a local JSON file.
+
+    Returns ``None`` only when neither is requested (pure-defaults callers).
+    """
+    if dsn:
+        return SettingsStore(dsn)
+    if local_path:
+        return LocalSettingsStore(local_path)
+    return None

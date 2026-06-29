@@ -87,7 +87,12 @@ REGISTRY: tuple[SettingSpec, ...] = (
     SettingSpec("grid_v_km", "Grid vertical spacing (km)", GROUP_DETECTION, "float",
                 0.5, "Cartesian analysis grid vertical spacing.", min=0.1, max=2.0),
     SettingSpec("watershed_split", "Watershed cell splitting", GROUP_DETECTION, "bool",
-                False, "Split merged reflectivity blobs via watershed."),
+                True, "Split merged multi-core systems into separate cells at "
+                "reflectivity saddles (seed split + footprint partition)."),
+    SettingSpec("watershed_min_sep_km", "Watershed peak separation (km)",
+                GROUP_DETECTION, "float", 14.0, "Minimum distance between split "
+                "cores when watershed splitting; larger merges nearby cores "
+                "(fewer cells).", min=1.0, max=50.0),
     SettingSpec("track_max_km", "Track max displacement (km)", GROUP_DETECTION, "float",
                 12.0, "Max centroid displacement between volumes to associate a "
                 "track.", min=0.0, max=100.0),
@@ -141,7 +146,8 @@ REGISTRY_BY_KEY: dict[str, SettingSpec] = {s.key: s for s in REGISTRY}
 DETECTION_KEYS: tuple[str, ...] = (
     "seed_dbz", "base_dbz", "seed_min_separation_km", "echo_top_min_km",
     "continuity_dbz", "continuity_levels", "min_area_km2", "grid_h_km",
-    "grid_v_km", "watershed_split", "track_max_km", "track_miss_max",
+    "grid_v_km", "watershed_split", "watershed_min_sep_km", "track_max_km",
+    "track_miss_max",
 )
 
 

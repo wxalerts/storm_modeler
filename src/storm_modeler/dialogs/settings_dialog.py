@@ -116,11 +116,12 @@ class _Filter(QSortFilterProxyModel):
 class SettingsDialog(QDialog):
     settingsChanged = Signal()
 
-    def __init__(self, dsn: str | None = None, parent=None) -> None:
+    def __init__(self, dsn: str | None = None, local_path=None, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.resize(640, 520)
         self.dsn = dsn
+        self.local_path = local_path
 
         layout = QVBoxLayout(self)
 
@@ -153,7 +154,7 @@ class SettingsDialog(QDialog):
 
     def _load(self) -> None:
         self.model.removeRows(0, self.model.rowCount())
-        self._resolved = resolve(self.dsn).values
+        self._resolved = resolve(self.dsn, self.local_path).values
         for spec in REGISTRY:
             label = QStandardItem(spec.label)
             label.setEditable(False)
@@ -184,11 +185,13 @@ class SettingsDialog(QDialog):
 
     def _save(self) -> None:
         changes = self.collect_changes()
-        if changes and self.dsn:
-            from ..settings.store import SettingsStore
+        if changes:
+            from ..settings.store import open_store
 
-            with SettingsStore(self.dsn) as store:
-                store.set_many(changes)
+            store = open_store(self.dsn, self.local_path)
+            if store is not None:
+                with store as s:
+                    s.set_many(changes)
         self._load()  # reflect persisted state
         self.settingsChanged.emit()
         self.accept()
