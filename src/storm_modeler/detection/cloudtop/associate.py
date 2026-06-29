@@ -1,24 +1,58 @@
 """Radar association — measure storm tilt from cloud-top vs radar core offset.
 
-Each cold cloud-top cell's coldest pixel (the overshooting-top candidate, the
-physical top of the updraft) is matched to the nearest radar storm cell's core
-(``StormCell.seed_lon``/``seed_lat``). The horizontal displacement between the
-two — ``tilt_km`` and its bearing — quantifies how far the cloud top leans off
-the low-level core: a large tilt indicates a sheared/tilted storm column, often
-with the anvil and overshooting top displaced downshear from the surface echo.
+Each cloud-top cell is first **parallax-corrected** to its true ground position
+(see :mod:`.parallax`) so a tall top registers over the storm that made it
+rather than off toward the satellite limb. Then each radar storm cell is matched
+to the cloud top that sits **over** it — the cloud top whose (parallax-corrected)
+anvil footprint contains the radar core, coldest top winning when several
+overlap, with a nearest-within-``assoc_max_km`` fallback. The matched radar
+:class:`StormCell` is annotated with ``cloud_top_c`` (coldest-pixel temperature,
+deg C) and ``overshooting_top`` for the volume listing; the cloud top records the
+residual core-to-top offset as storm tilt (``tilt_km`` / ``tilt_bearing_deg``).
 
-Pure given the two cell lists; the caller pairs a scene to the radar volume
-nearest in time before calling.
+A single anvil may overlie several cells, so cloud tops are **not** claimed
+exclusively. Pure given the two cell lists; the caller pairs a scene to the radar
+volume nearest in time before calling.
 """
 
 from __future__ import annotations
 
 from typing import Iterable
 
+import numpy as np
+from shapely.geometry import Point, Polygon
+
 from ..detection_v2.types import StormCell
 from ...settings.resolver import CloudTopParams
 from .geo import haversine_km, initial_bearing_deg
+from .parallax import bt_to_height_m, correct, subsat_lon
 from .types import CloudTopCell
+
+#: Leniency (deg, ~5 km) when testing whether an anvil footprint covers a core.
+_ENVELOPE_BUFFER_DEG = 0.05
+
+
+def _parallax_correct_cell(c: CloudTopCell) -> None:
+    """Shift a cloud top's geometry to true ground (in place).
+
+    The coldest pixel uses the deepest (highest) top; the anvil centroid and
+    footprint use the cell-mean height — warmer anvil edges sit lower and shift
+    less, but one height per cell is plenty for the association test.
+    """
+    sat_lon = subsat_lon(c.satellite)
+    h_cold = bt_to_height_m(c.min_bt_k)
+    h_anvil = bt_to_height_m(c.mean_bt_k)
+    c.cold_lon, c.cold_lat = correct(c.cold_lon, c.cold_lat, h_cold, sat_lon)
+    c.centroid_lon, c.centroid_lat = correct(
+        c.centroid_lon, c.centroid_lat, h_anvil, sat_lon
+    )
+    try:
+        xs, ys = c.envelope.exterior.xy
+        lon_t, lat_t = correct(np.asarray(xs), np.asarray(ys), h_anvil, sat_lon)
+        poly = Polygon(zip(np.atleast_1d(lon_t), np.atleast_1d(lat_t)))
+        c.envelope = poly if poly.is_valid else poly.buffer(0)
+    except Exception:  # noqa: BLE001 - keep the apparent envelope if reshape fails
+        pass
 
 
 def associate_radar(
@@ -26,37 +60,49 @@ def associate_radar(
     radar_cells: Iterable[StormCell],
     params: CloudTopParams | None = None,
 ) -> list[CloudTopCell]:
-    """Match each cold-top cell to its nearest radar core; set tilt + CT fields.
+    """Parallax-correct cloud tops, then annotate radar cells with the top over them.
 
-    Greedy nearest-neighbour within ``assoc_max_km`` (cold-tops are processed
-    coldest-first); each radar cell is claimed at most once. Mutates **both**
-    sides in place: the cloud-top cell gets ``radar_track_id``/``tilt_km``/
-    ``tilt_bearing_deg``; the matched radar :class:`StormCell` gets
-    ``cloud_top_c`` (coldest-pixel temperature in deg C) and ``overshooting_top``,
-    so the volume listing can show a cloud-top temperature and OT flag per storm.
-    Returns the cloud-top cells. Unmatched cloud tops keep ``radar_track_id ==
-    -1`` / NaN tilt; unmatched radar cells keep ``cloud_top_c is None``.
+    Mutates both sides in place and returns the cloud-top cells. Radar cells with
+    no cloud top over them (or within ``assoc_max_km``) keep ``cloud_top_c is
+    None``; unmatched cloud tops keep ``radar_track_id == -1`` / NaN tilt.
     """
     params = params or CloudTopParams()
-    radar = list(radar_cells)
-    claimed: set[int] = set()
 
+    # 1. Parallax-correct every cloud top (always — markers/persistence too).
     for c in cloudtop_cells:
-        best_i, best_d = -1, params.assoc_max_km
-        for i, r in enumerate(radar):
-            if i in claimed:
+        _parallax_correct_cell(c)
+
+    radar = list(radar_cells)
+    if not radar:
+        return cloudtop_cells
+
+    # 2. Match each radar cell to the cloud top that sits over it.
+    for r in radar:
+        core = Point(r.seed_lon, r.seed_lat)
+        covering = [
+            c for c in cloudtop_cells
+            if c.envelope.buffer(_ENVELOPE_BUFFER_DEG).contains(core)
+        ]
+        if covering:
+            best = min(covering, key=lambda c: c.min_bt_k)  # deepest/coldest top
+        else:
+            best, best_d = None, params.assoc_max_km
+            for c in cloudtop_cells:
+                d = haversine_km(r.seed_lon, r.seed_lat, c.cold_lon, c.cold_lat)
+                if d <= best_d:
+                    best_d, best = d, c
+            if best is None:
                 continue
-            d = haversine_km(c.cold_lon, c.cold_lat, r.seed_lon, r.seed_lat)
-            if d <= best_d:
-                best_d, best_i = d, i
-        if best_i >= 0:
-            r = radar[best_i]
-            c.radar_track_id = r.track_id
-            c.tilt_km = best_d
-            c.tilt_bearing_deg = initial_bearing_deg(
-                r.seed_lon, r.seed_lat, c.cold_lon, c.cold_lat
+
+        r.cloud_top_c = best.min_bt_k - 273.15
+        r.overshooting_top = best.overshooting_top
+
+        # Record storm tilt on the cloud top (closest core wins when shared).
+        d = haversine_km(r.seed_lon, r.seed_lat, best.cold_lon, best.cold_lat)
+        if best.radar_track_id == -1 or d < best.tilt_km:
+            best.radar_track_id = r.track_id
+            best.tilt_km = d
+            best.tilt_bearing_deg = initial_bearing_deg(
+                r.seed_lon, r.seed_lat, best.cold_lon, best.cold_lat
             )
-            r.cloud_top_c = c.min_bt_k - 273.15
-            r.overshooting_top = c.overshooting_top
-            claimed.add(best_i)
     return cloudtop_cells

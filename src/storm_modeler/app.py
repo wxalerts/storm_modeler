@@ -115,6 +115,7 @@ def _build_window(persist: bool):
             self._sat_results: list = []
             self._sat_tracker = None
             self._sat_persistence = None
+            self._current_sat_time = None  # valid_time of the scene on the map
             # On-disk cache of downloaded warnings (volumes + metadata) so the
             # "Downloaded" list and its data survive app restarts.
             self.downloads = DownloadStore()
@@ -182,6 +183,7 @@ def _build_window(persist: bool):
             self.lightning_window.clear_requested.connect(self.map.clear_lightning)
             self.satellite_window.fetch_requested.connect(self.on_fetch_satellite)
             self.satellite_window.clear_requested.connect(self.map.clear_satellite)
+            self.satellite_window.opacity_changed.connect(self.map.set_satellite_opacity)
 
             # Repopulate the "Downloaded" list from the on-disk cache.
             self._load_persisted_downloads()
@@ -497,6 +499,7 @@ def _build_window(persist: bool):
                 self.volumes.add_result(res)
                 self.map.show_result(res.warning, res.volume, res.cells)
                 self._show_lightning_for(res.volume)
+                self._show_satellite_for(res.volume)
             self.statusBar().showMessage(
                 f"{res.warning.event}  {res.volume.valid_time:%H%MZ}  "
                 f"{res.index}/{res.total}  {len(res.cells)} cell(s)"
@@ -523,6 +526,7 @@ def _build_window(persist: bool):
             if getattr(self, "_map_warning", None) is not None:
                 self.map.show_cell_selection(self._map_warning, volume, cells, cell)
                 self._show_lightning_for(volume)
+                self._show_satellite_for(volume)
 
         def _on_error(self, msg: str) -> None:
             log.error("worker.error", msg=msg)
@@ -624,7 +628,30 @@ def _build_window(persist: bool):
             self._sat_results = []  # [(SatelliteScene, list[CloudTopCell])]
             self._sat_tracker = None
             self._sat_persistence = None
+            self._current_sat_time = None
             self.map.clear_satellite()
+
+        def _show_satellite_for(self, volume=None) -> None:
+            """Overlay the cloud-top scene nearest in time to the displayed volume.
+
+            Keeps the satellite layer locked to the radar volume currently on the
+            map (selection or 3D playback), so the two views always show the same
+            moment. With no volume on screen yet, falls back to the latest scene.
+            """
+            if not self._sat_results:
+                return
+            t = volume.valid_time if volume is not None else self._current_valid_time
+            if t is None:
+                scene, cells = self._sat_results[-1]
+            else:
+                scene, cells = min(
+                    self._sat_results,
+                    key=lambda sc: abs((sc[0].valid_time - t).total_seconds()),
+                )
+            if scene.valid_time == self._current_sat_time:
+                return  # already showing this scene
+            self._current_sat_time = scene.valid_time
+            self.map.show_satellite(scene, cells)
 
         def _maybe_auto_satellite(self, warning) -> None:
             """Chain a cloud-top pull after a radar download, if enabled.
@@ -641,7 +668,10 @@ def _build_window(persist: bool):
 
         def on_fetch_satellite(self, warning) -> None:
             """Ingest GOES ABI scenes for *warning*, detect cloud tops, overlay them."""
-            from .config import SATELLITE_MODULES
+            import math
+
+            from .config import DEFAULT_GRID, SATELLITE_MODULES
+            from .data.radar_render import geo_bounds
             from .data.satellite import ABISource, satellite_for
             from .data.volumes import bounded_window
             from .detection.cloudtop import Tracker as CloudTopTracker
@@ -659,9 +689,22 @@ def _build_window(persist: bool):
                 warning.issued, warning.expires,
                 self.settings.pre_minutes, self.settings.post_minutes,
             )
-            lon0, lat0, lon1, lat1 = warning.polygon.bounds
+            # Crop the satellite scene to the NEXRAD volume footprint (the radar
+            # analysis-grid extent), so the full storm anvil is in frame rather
+            # than just the warning polygon. Use the actual gridded volume bounds
+            # when a download exists, else the site + grid half-width.
+            site = self.resolver.for_polygon(warning.polygon)
             pad = self.settings.sat_bbox_pad_deg
-            bbox = (lon0 - pad, lat0 - pad, lon1 + pad, lat1 + pad)
+            results = self._results.get(warning.id) or []
+            if results:
+                lon_min, lon_max, lat_min, lat_max = geo_bounds(results[0].volume)
+                bbox = (lon_min - pad, lat_min - pad, lon_max + pad, lat_max + pad)
+            else:
+                half = DEFAULT_GRID.half_width_km
+                dlat = half / 110.574
+                dlon = half / (111.320 * max(0.1, math.cos(math.radians(site.lat))))
+                bbox = (site.lon - dlon - pad, site.lat - dlat - pad,
+                        site.lon + dlon + pad, site.lat + dlat + pad)
             _, label, short = satellite_for(warning.centroid[0], w0.date())
             cparams = self.settings.cloudtop
 
@@ -745,7 +788,10 @@ def _build_window(persist: bool):
 
             self._sat_results.append((scene, cells))
             if warning.id == self._selected_id:
-                self.map.show_satellite(scene, cells)
+                # Show the scene matched to the radar volume currently on the map
+                # (not just the latest fetched), so the layers stay in sync.
+                self._current_sat_time = None  # force a re-pick
+                self._show_satellite_for()
             n_cells = sum(len(c) for _, c in self._sat_results)
             n_ot = sum(1 for _, c in self._sat_results for x in c if x.overshooting_top)
             self.satellite_window.set_count(len(self._sat_results), n_cells, n_ot)

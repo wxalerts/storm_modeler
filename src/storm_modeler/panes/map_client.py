@@ -283,6 +283,10 @@ class MapClient:
     def clear_satellite(self) -> None:
         self._send({"cmd": "satellite_clear"})
 
+    def set_satellite_opacity(self, value: float) -> None:
+        """Set the brightness-temperature overlay opacity (0.0–1.0)."""
+        self._send({"cmd": "satellite_opacity", "value": float(value)})
+
     def highlight_cell(self, cell: StormCell) -> None:
         # Recenter only — keep the user's current zoom while stepping volumes.
         self._send({"cmd": "highlight", "geojson": mapping(cell.envelope)})

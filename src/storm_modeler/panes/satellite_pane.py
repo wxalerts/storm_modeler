@@ -12,27 +12,32 @@ lets the app compute the time window, bbox, and satellite from settings.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QPushButton,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
 
 from ..models import Warning
 
+#: Default BT-overlay opacity (percent) — matches the map's initial value.
+_DEFAULT_OPACITY_PCT = 55
+
 
 class SatelliteWindow(QMainWindow):
     fetch_requested = Signal(object)  # Warning
     clear_requested = Signal()
+    opacity_changed = Signal(float)  # BT-overlay opacity, 0.0–1.0
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Satellite")
-        self.resize(380, 240)
+        self.resize(380, 280)
         self._warning: Warning | None = None
 
         central = QWidget()
@@ -65,9 +70,21 @@ class SatelliteWindow(QMainWindow):
         buttons.addWidget(self.fetch_btn)
         buttons.addWidget(self.clear_btn)
 
+        # BT-overlay opacity control (how much of the satellite layer shows on
+        # the Leaflet map).
+        opacity_row = QHBoxLayout()
+        self.opacity_caption = QLabel(f"Overlay opacity  {_DEFAULT_OPACITY_PCT}%")
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+        self.opacity_slider.setValue(_DEFAULT_OPACITY_PCT)
+        self.opacity_slider.valueChanged.connect(self._on_opacity)
+        opacity_row.addWidget(self.opacity_caption)
+        opacity_row.addWidget(self.opacity_slider, 1)
+
         layout.addWidget(self.event_label)
         layout.addWidget(self.window_label)
         layout.addLayout(buttons)
+        layout.addLayout(opacity_row)
         layout.addWidget(self.count_label)
         layout.addWidget(self.status_label)
         layout.addWidget(self.hint_label)
@@ -97,6 +114,10 @@ class SatelliteWindow(QMainWindow):
         self.count_label.setText(
             f"{n_scenes} scene(s) · {n_cells} cloud-top cell(s) · {n_ot} OT"
         )
+
+    def _on_opacity(self, pct: int) -> None:
+        self.opacity_caption.setText(f"Overlay opacity  {pct}%")
+        self.opacity_changed.emit(pct / 100.0)
 
     def _on_fetch(self) -> None:
         if self._warning is not None:

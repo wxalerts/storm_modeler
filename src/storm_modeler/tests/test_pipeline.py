@@ -102,10 +102,11 @@ def test_satellite_pipeline_over_fixture_scenes(tmp_path):
     # One stable track across all three scenes.
     track_ids = {c.track_id for r in results for c in r.cloudtops}
     assert track_ids == {1}
-    # The first scene's cold top is tilted against the radar core.
+    # The first scene's cold top is tilted against the radar core (residual
+    # offset after parallax correction).
     first = results[0].cloudtops[0]
     assert first.radar_track_id == radar_cells[0].track_id
-    assert 0.0 < first.tilt_km < 15.0
+    assert 0.0 < first.tilt_km < 40.0
 
 
 def test_replay_is_deterministic(tornado_case):

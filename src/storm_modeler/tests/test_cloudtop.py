@@ -84,7 +84,8 @@ def test_radar_association_tilt():
     ct.associate_radar(cells, radar, CloudTopParams())
     c = cells[0]
     assert c.radar_track_id == radar[0].track_id
-    assert 0.0 < c.tilt_km < 15.0
+    # Tilt is the residual offset after parallax correction (a few to tens of km).
+    assert 0.0 < c.tilt_km < 40.0
     assert np.isfinite(c.tilt_bearing_deg)
     # The radar cell is annotated with cloud-top temp (deg C) + OT for the listing.
     assert radar[0].cloud_top_c is not None
@@ -104,6 +105,23 @@ def test_radar_association_skips_distant_cell():
     ct.associate_radar(cells, radar, CloudTopParams())
     assert cells[0].radar_track_id == -1
     assert np.isnan(cells[0].tilt_km)
+
+
+def test_parallax_shifts_toward_subsatellite():
+    """A tall cloud top corrects toward the sub-satellite point, by ~10-30 km."""
+    from storm_modeler.detection.cloudtop.geo import haversine_km
+    from storm_modeler.detection.cloudtop.parallax import correct, subsat_lon
+
+    sat_lon = subsat_lon("GOES-19")  # -75.2
+    lon_a, lat_a = -97.5, 36.0  # an OUN-area apparent cloud top
+    lon_t, lat_t = correct(lon_a, lat_a, 13000.0, sat_lon)  # 13 km top
+    # True ground is east (toward the sub-satellite longitude) of the apparent.
+    assert lon_t > lon_a
+    shift = haversine_km(lon_a, lat_a, lon_t, lat_t)
+    assert 8.0 < shift < 35.0
+    # Zero height = no shift.
+    lon0, lat0 = correct(lon_a, lat_a, 0.0, sat_lon)
+    assert abs(lon0 - lon_a) < 1e-6 and abs(lat0 - lat_a) < 1e-6
 
 
 def test_determinism():

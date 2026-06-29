@@ -16,6 +16,7 @@ Protocol: one JSON object per line on stdin. Commands:
     {"cmd": "lightning_clear"}
     {"cmd": "satellite", "url": "data:image/png;base64,...", "bounds": [[s,w],[n,e]]}
     {"cmd": "satellite_clear"}
+    {"cmd": "satellite_opacity", "value": 0.55}  # BT overlay opacity 0..1
     {"cmd": "cloudtops",  "geojson": {...}}  # cloud-top cells (anvil/OT markers)
     {"cmd": "fit",       "bounds": [[s,w],[n,e]]}
     {"cmd": "clear"}
@@ -78,9 +79,12 @@ function setLightning(pts){ if(lightningLayer)map.removeLayer(lightningLayer);
 function clearLightning(){ if(lightningLayer)map.removeLayer(lightningLayer);
   lightningLayer=null;}
 // GOES ABI Band-13 brightness temperature: a translucent image overlay under
-// the cloud-top markers (sits above radar so cold tops read on the IR).
+// the cloud-top markers (sits above radar so cold tops read on the IR). The
+// opacity is user-controlled and persists across scene updates.
+var satOpacity=0.55;
 function setSatellite(url,b){ if(satLayer)map.removeLayer(satLayer);
-  satLayer=L.imageOverlay(url,b,{opacity:0.55}).addTo(map);}
+  satLayer=L.imageOverlay(url,b,{opacity:satOpacity}).addTo(map);}
+function setSatelliteOpacity(v){ satOpacity=v; if(satLayer)satLayer.setOpacity(v);}
 function clearSatellite(){ if(satLayer)map.removeLayer(satLayer); satLayer=null;
   if(cloudtopLayer)map.removeLayer(cloudtopLayer); cloudtopLayer=null;}
 // Cloud-top cells: anvil/footprint polygons + coldest-pixel markers (overshooting
@@ -188,6 +192,8 @@ class MapApp:
             self._js(f"setSatellite({json.dumps(msg['url'])}, {json.dumps(msg['bounds'])});")
         elif cmd == "satellite_clear":
             self._js("clearSatellite();")
+        elif cmd == "satellite_opacity":
+            self._js(f"setSatelliteOpacity({float(msg['value'])});")
         elif cmd == "cloudtops":
             self._js(f"setCloudtops({json.dumps(msg['geojson'])});")
         elif cmd == "fit":
