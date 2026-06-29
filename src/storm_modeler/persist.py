@@ -22,6 +22,7 @@ from typing import Iterable
 import structlog
 
 from .config import pg_dsn
+from .detection.cloudtop import CloudTopCell
 from .detection.detection_v2 import StormCell
 from .models import Warning
 
@@ -78,6 +79,34 @@ CREATE TABLE IF NOT EXISTS cells_v2 (
 CREATE INDEX IF NOT EXISTS cells_v2_valid_time_idx ON cells_v2 (valid_time);
 CREATE INDEX IF NOT EXISTS cells_v2_warning_idx ON cells_v2 (warning_id);
 CREATE INDEX IF NOT EXISTS cells_v2_envelope_gix ON cells_v2 USING gist (envelope);
+
+CREATE TABLE IF NOT EXISTS cloudtop_cells_v2 (
+    id             bigserial,
+    warning_id     text REFERENCES warnings_v2 (id) ON DELETE CASCADE,
+    event_type     text,
+    settings_hash  text,
+    satellite      text NOT NULL,
+    valid_time     timestamptz NOT NULL,
+    track_id       integer NOT NULL,
+    cell_id        integer NOT NULL,
+    min_bt_k       real,
+    mean_bt_k      real,
+    area_km2       real,
+    anviled_out    boolean,
+    overshooting_top boolean,
+    ot_depth_k     real,
+    radar_track_id integer,
+    tilt_km        real,
+    tilt_bearing_deg real,
+    cold           geometry(Point, 4326),
+    centroid       geometry(Point, 4326),
+    envelope       geometry(Polygon, 4326),
+    PRIMARY KEY (id, valid_time),
+    UNIQUE (warning_id, satellite, valid_time, track_id)
+);
+CREATE INDEX IF NOT EXISTS cloudtop_v2_valid_time_idx ON cloudtop_cells_v2 (valid_time);
+CREATE INDEX IF NOT EXISTS cloudtop_v2_warning_idx ON cloudtop_cells_v2 (warning_id);
+CREATE INDEX IF NOT EXISTS cloudtop_v2_envelope_gix ON cloudtop_cells_v2 USING gist (envelope);
 """
 
 # Attempt to make cells_v2 a Timescale hypertable on valid_time. No-op (and
@@ -85,6 +114,8 @@ CREATE INDEX IF NOT EXISTS cells_v2_envelope_gix ON cells_v2 USING gist (envelop
 TIMESCALE_SQL = """
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 SELECT create_hypertable('cells_v2', 'valid_time',
+                         if_not_exists => TRUE, migrate_data => TRUE);
+SELECT create_hypertable('cloudtop_cells_v2', 'valid_time',
                          if_not_exists => TRUE, migrate_data => TRUE);
 """
 
@@ -210,6 +241,65 @@ class Persistence:
                         c.seed_lat, c.max_dbz, c.area_km2, c.echo_top_km,
                         c.base_km, c.depth_km, c.n_levels,
                         wkb.dumps(pt), wkb.dumps(c.envelope),
+                    ),
+                )
+                n += 1
+        self._conn.commit()
+        return n
+
+    def upsert_cloudtops(
+        self,
+        warning_id: str,
+        event_type: str,
+        cells: Iterable[CloudTopCell],
+        settings_hash: str | None = None,
+    ) -> int:
+        from shapely import wkb
+        from shapely.geometry import Point
+
+        n = 0
+        with self._conn.cursor() as cur:
+            for c in cells:
+                cold = Point(c.cold_lon, c.cold_lat)
+                centroid = Point(c.centroid_lon, c.centroid_lat)
+                cur.execute(
+                    """
+                    INSERT INTO cloudtop_cells_v2
+                        (warning_id, event_type, settings_hash, satellite,
+                         valid_time, track_id, cell_id, min_bt_k, mean_bt_k,
+                         area_km2, anviled_out, overshooting_top, ot_depth_k,
+                         radar_track_id, tilt_km, tilt_bearing_deg,
+                         cold, centroid, envelope)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                            ST_GeomFromWKB(%s,4326), ST_GeomFromWKB(%s,4326),
+                            ST_GeomFromWKB(%s,4326))
+                    ON CONFLICT (warning_id, satellite, valid_time, track_id)
+                    DO UPDATE SET
+                        event_type=EXCLUDED.event_type,
+                        settings_hash=EXCLUDED.settings_hash,
+                        cell_id=EXCLUDED.cell_id,
+                        min_bt_k=EXCLUDED.min_bt_k,
+                        mean_bt_k=EXCLUDED.mean_bt_k,
+                        area_km2=EXCLUDED.area_km2,
+                        anviled_out=EXCLUDED.anviled_out,
+                        overshooting_top=EXCLUDED.overshooting_top,
+                        ot_depth_k=EXCLUDED.ot_depth_k,
+                        radar_track_id=EXCLUDED.radar_track_id,
+                        tilt_km=EXCLUDED.tilt_km,
+                        tilt_bearing_deg=EXCLUDED.tilt_bearing_deg,
+                        cold=EXCLUDED.cold,
+                        centroid=EXCLUDED.centroid,
+                        envelope=EXCLUDED.envelope
+                    """,
+                    (
+                        warning_id, event_type, settings_hash, c.satellite,
+                        c.valid_time, c.track_id, c.cell_id, c.min_bt_k,
+                        c.mean_bt_k, c.area_km2, c.anviled_out, c.overshooting_top,
+                        c.ot_depth_k, c.radar_track_id,
+                        None if c.tilt_km != c.tilt_km else c.tilt_km,
+                        None if c.tilt_bearing_deg != c.tilt_bearing_deg
+                        else c.tilt_bearing_deg,
+                        wkb.dumps(cold), wkb.dumps(centroid), wkb.dumps(c.envelope),
                     ),
                 )
                 n += 1

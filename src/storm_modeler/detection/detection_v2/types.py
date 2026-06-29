@@ -32,6 +32,10 @@ class StormCell:
     n_levels: int
     envelope: Polygon  # convex-hull footprint in lon/lat
     track_id: int = -1  # assigned by the tracker; -1 until tracked
+    # GOES ABI cloud-top annotation, filled by ``cloudtop.associate_radar`` once
+    # a satellite scene is matched to this cell (None/False until then).
+    cloud_top_c: float | None = None  # cloud-top temperature, deg C
+    overshooting_top: bool = False  # the matched cloud top overshoots its anvil
 
     def summary(self) -> str:
         return (
@@ -55,5 +59,7 @@ class StormCell:
             "base_km": self.base_km,
             "depth_km": self.depth_km,
             "n_levels": self.n_levels,
+            "cloud_top_c": self.cloud_top_c,
+            "overshooting_top": self.overshooting_top,
             "envelope": mapping(self.envelope),
         }

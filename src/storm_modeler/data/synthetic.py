@@ -20,7 +20,7 @@ import numpy as np
 from pyproj import Transformer
 
 from ..config import DEFAULT_GRID, GridConfig
-from ..models import GriddedVolume
+from ..models import GriddedVolume, SatelliteScene
 
 # Default fixture grid spacing (km). Matches the registry grid_h_km / grid_v_km
 # defaults; kept here so synthetic volumes need no settings store.
@@ -134,6 +134,55 @@ def make_ap_volume(
         z=z,
         lat0=lat0,
         lon0=lon0,
+    )
+
+
+def make_cold_scene(
+    satellite: str,
+    valid_time: datetime | str,
+    bbox: tuple[float, float, float, float],
+    core_lon: float,
+    core_lat: float,
+    anvil_radius_km: float = 30.0,
+    core_radius_km: float = 6.0,
+    anvil_bt_k: float = 215.0,
+    core_bt_k: float = 198.0,
+    warm_bt_k: float = 285.0,
+    res_deg: float = 0.02,
+    band: int = 13,
+) -> SatelliteScene:
+    """A textbook cold cloud top: a broad anvil with a colder embedded core.
+
+    Brightness temperature falls from ``warm_bt_k`` outside the storm to
+    ``anvil_bt_k`` across the anvil (Gaussian, scale ``anvil_radius_km``), with a
+    sharper colder dip to ``core_bt_k`` at ``(core_lon, core_lat)`` (scale
+    ``core_radius_km``) — the overshooting top. Closed-form, no RNG, so a given
+    call yields byte-identical scenes (the determinism mandate). The raster runs
+    north→south (row 0 = north) to match :class:`SatelliteScene`.
+    """
+    lon_min, lat_min, lon_max, lat_max = bbox
+    lons = np.arange(lon_min, lon_max + res_deg / 2, res_deg, dtype=np.float64)
+    lats = np.arange(lat_max, lat_min - res_deg / 2, -res_deg, dtype=np.float64)
+    LON, LAT = np.meshgrid(lons, lats)  # (nlat, nlon)
+
+    lat_c = 0.5 * (lat_min + lat_max)
+    km_per_deg_lat = 110.57
+    km_per_deg_lon = 111.32 * np.cos(np.radians(lat_c))
+    dist_km = np.hypot(
+        (LON - core_lon) * km_per_deg_lon, (LAT - core_lat) * km_per_deg_lat
+    )
+
+    anvil = (warm_bt_k - anvil_bt_k) * np.exp(-(dist_km / anvil_radius_km) ** 2)
+    core = (anvil_bt_k - core_bt_k) * np.exp(-(dist_km / core_radius_km) ** 2)
+    bt = (warm_bt_k - anvil - core).astype(np.float32)
+    return SatelliteScene(
+        satellite=satellite,
+        band=band,
+        valid_time=valid_time,
+        bt=bt,
+        lons=lons,
+        lats=lats,
+        bbox=bbox,
     )
 
 

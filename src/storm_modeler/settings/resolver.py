@@ -18,7 +18,7 @@ from typing import Any
 
 from pathlib import Path
 
-from .registry import DETECTION_KEYS, defaults
+from .registry import CLOUDTOP_KEYS, DETECTION_KEYS, defaults
 from .store import open_store
 
 
@@ -49,6 +49,36 @@ class DetectionParams:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "DetectionParams":
         return cls(**{k: d[k] for k in DETECTION_KEYS if k in d})
+
+
+@dataclass(frozen=True)
+class CloudTopParams:
+    """The GOES ABI cloud-top knob set. Passed explicitly to ``cloudtop.run``.
+
+    Field names drop the ``sat_`` prefix the registry keys carry; ``from_dict``
+    maps the resolved ``sat_*`` settings onto them.
+    """
+
+    cold_bt_k: float = 235.0
+    min_area_km2: float = 25.0
+    anvil_bt_k: float = 220.0
+    anvil_area_km2: float = 2500.0
+    ot_delta_k: float = 6.5
+    ot_max_bt_k: float = 205.0
+    track_max_km: float = 20.0
+    track_miss_max: int = 2
+    assoc_max_km: float = 15.0
+
+    @property
+    def settings_hash(self) -> str:
+        """Stable short digest of the knob set (provenance)."""
+        payload = json.dumps(asdict(self), sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "CloudTopParams":
+        # registry key "sat_cold_bt_k" → field "cold_bt_k", etc.
+        return cls(**{k[len("sat_"):]: d[k] for k in CLOUDTOP_KEYS if k in d})
 
 
 @dataclass(frozen=True)
@@ -83,6 +113,20 @@ class ResolvedSettings:
     @property
     def viewer(self) -> "ViewerParams":
         return ViewerParams.from_values(self.values)
+
+    # -- Satellite (GOES ABI cloud-top) projections ------------------------
+
+    @property
+    def cloudtop(self) -> CloudTopParams:
+        return CloudTopParams.from_dict(self.values)
+
+    @property
+    def sat_bbox_pad_deg(self) -> float:
+        return float(self.values.get("sat_bbox_pad_deg", 0.5))
+
+    @property
+    def sat_target_res_deg(self) -> float:
+        return float(self.values.get("sat_target_res_deg", 0.02))
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.values.get(key, default)

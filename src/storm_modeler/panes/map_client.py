@@ -66,6 +66,37 @@ def _features(geoms) -> dict:
     }
 
 
+def _cloudtop_features(cloudtops) -> dict:
+    """GeoJSON for cloud-top cells: anvil footprints + coldest-pixel markers.
+
+    Each cell yields its envelope polygon (flagged ``anvil`` when anviled out)
+    and a point at the coldest pixel (``ot`` when an overshooting top), carrying
+    BT and tilt in the properties for map popups.
+    """
+    feats = []
+    for c in cloudtops:
+        props = {
+            "min_bt_k": round(c.min_bt_k, 1),
+            "mean_bt_k": round(c.mean_bt_k, 1),
+            "area_km2": round(c.area_km2, 0),
+            "track_id": c.track_id,
+            "ot": bool(c.overshooting_top),
+            "anvil": bool(c.anviled_out),
+        }
+        import math as _math
+        if not _math.isnan(c.tilt_km):
+            props["tilt_km"] = round(c.tilt_km, 1)
+            props["tilt_bearing_deg"] = round(c.tilt_bearing_deg, 0)
+            props["radar_track_id"] = c.radar_track_id
+        feats.append({"type": "Feature",
+                      "properties": {**props, "kind": "anvil" if c.anviled_out else "cloud"},
+                      "geometry": mapping(c.envelope)})
+        feats.append({"type": "Feature",
+                      "properties": {**props, "kind": "ot" if c.overshooting_top else "core"},
+                      "geometry": {"type": "Point", "coordinates": [c.cold_lon, c.cold_lat]}})
+    return {"type": "FeatureCollection", "features": feats}
+
+
 class MapClient:
     def __init__(self) -> None:
         self.proc: subprocess.Popen | None = None
@@ -139,12 +170,27 @@ class MapClient:
         self._error_win = win
 
     def shutdown(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            try:
-                self.proc.stdin.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self.proc.terminate()
+        if self.proc is None or self.proc.poll() is not None:
+            return
+        # Close stdin first: the child sees EOF, persists its window geometry,
+        # and quits on its own (see map_window_gtk.main). Give it a moment to do
+        # so before falling back to signals — otherwise we'd kill it mid-save.
+        try:
+            self.proc.stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.proc.wait(timeout=2.0)
+            return
+        except Exception:  # noqa: BLE001 - didn't exit in time; escalate
+            pass
+        # Still alive: SIGTERM (the child also saves geometry on SIGTERM), then
+        # SIGKILL as a last resort so we never leave the map process orphaned.
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=2.0)
+        except Exception:  # noqa: BLE001
+            self.proc.kill()
 
     # --- command channel --------------------------------------------------
 
@@ -183,6 +229,59 @@ class MapClient:
 
     def add_cells(self, cells) -> None:
         self._send({"cmd": "cells", "geojson": _features([c.envelope for c in cells])})
+
+    # --- lightning --------------------------------------------------------
+
+    def show_lightning(self, flashes, span=None) -> None:
+        """Layer GLM flashes as markers, coloured oldest→newest in the window.
+
+        Sent compactly as ``[lat, lon, t_frac]`` triples (t_frac in [0,1]) so
+        thousands of points stay a small payload. ``span`` is an optional
+        ``(t0, t1)`` of POSIX seconds to normalise the colour ramp against — pass
+        the whole event's span so a single volume's slice keeps a consistent
+        colour as the user steps through volumes (instead of each slice
+        re-spanning blue→red on its own).
+        """
+        flashes = list(flashes)
+        if not flashes:
+            self._send({"cmd": "lightning", "points": []})
+            return
+        if span is not None:
+            t0, t1 = span
+        else:
+            ts = [f.time.timestamp() for f in flashes]
+            t0, t1 = min(ts), max(ts)
+        width = (t1 - t0) or 1.0
+        points = [[round(f.lat, 4), round(f.lon, 4),
+                   round(min(1.0, max(0.0, (f.time.timestamp() - t0) / width)), 3)]
+                  for f in flashes]
+        self._send({"cmd": "lightning", "points": points})
+
+    def clear_lightning(self) -> None:
+        self._send({"cmd": "lightning_clear"})
+
+    # --- satellite (GOES ABI cloud tops) ----------------------------------
+
+    def show_satellite(self, scene, cloudtops) -> None:
+        """Overlay a scene's brightness-temperature image + cloud-top markers.
+
+        The scene is already a regular lon/lat raster (row 0 = north), so its BT
+        colorizes straight to an image overlay; cloud-top cells become GeoJSON —
+        a coldest-pixel marker per cell (styled as an overshooting top when
+        flagged), the anvil footprint polygon when anviled out, and tilt details
+        in the feature properties for popups.
+        """
+        rgba = radar_render.bt_to_rgba(scene.bt)
+        lat_min, lon_min, lat_max, lon_max = scene.geo_bounds()
+        self._send({"cmd": "satellite", "url": _rgba_data_url(rgba),
+                    "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
+                    "time": scene.valid_time.strftime("%H:%MZ"),
+                    "satellite": scene.satellite})
+        self._send({"cmd": "cloudtops",
+                    "geojson": _cloudtop_features(cloudtops)})
+
+    def clear_satellite(self) -> None:
+        self._send({"cmd": "satellite_clear"})
 
     def highlight_cell(self, cell: StormCell) -> None:
         # Recenter only — keep the user's current zoom while stepping volumes.

@@ -2,19 +2,20 @@
 
 A ``QSplitter(Qt.Vertical)``:
 
-* **top** — a 3D perspective ``pyvistaqt.QtInteractor`` showing the selected
-  cell's volume: dBZ volume render, isosurface shells, the envelope prism, and a
-  labelled height marker (B1);
-* **bottom** — the vertical cross-section panel (a second ``QtInteractor``) plus
-  a time scrubber over the warning's volumes (B2).
+* **top** — an echo-top height chart (a matplotlib ``FigureCanvasQTAgg``)
+  tracing the selected storm's column height (km AGL) across every volume in the
+  event, with a marker on the frame currently shown below;
+* **bottom** — the vertical cross-section panel (a ``pyvistaqt.QtInteractor``)
+  plus a time scrubber over the warning's volumes (B2).
 
-Clicking a storm in the left-volumes pane drives this. Scrubbing the slider
-loads each volume's grid via :class:`GridProvider` on a ``QThreadPool`` worker
-(off the GUI thread) and rebuilds the 3D scene + cross-section when it arrives;
-stale frames from fast dragging are dropped (coalesced) by a request id. The
-camera is held fixed between scrub frames so you watch the echo top climb and
-the envelope grow in place. The same offscreen-GL tolerance the map pane uses
-applies: with no display the actors are still built but ``render()`` is skipped.
+Clicking a storm in the left-volumes pane drives this. The chart is built once
+from the in-RAM ``VolumeResult`` list (following one ``track_id`` across
+volumes). Scrubbing the slider loads each volume's grid via :class:`GridProvider`
+on a ``QThreadPool`` worker (off the GUI thread) and rebuilds the cross-section
+when it arrives; stale frames from fast dragging are dropped (coalesced) by a
+request id, and the chart's current-frame marker follows along. The same
+offscreen-GL tolerance the map pane uses applies to the cross-section: with no
+display the actors are still built but ``render()`` is skipped.
 """
 
 from __future__ import annotations
@@ -29,30 +30,93 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSplitter,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
+
 from ..detection.detection_v2 import StormCell
 from ..settings.resolver import ResolvedSettings, ViewerParams
-from ..viz import scene_builder, xsection
+from ..viz import xsection
 from ..viz.grid_provider import GridProvider
 
 log = structlog.get_logger(__name__)
 
-# Toolbar toggles: (layer key, button label).
-_TOGGLES = (
-    ("volume", "Volume"),
-    ("isosurfaces", "Isosurfaces"),
-    ("envelope", "Envelope"),
-    ("height", "Height"),
-    ("other_cells", "Other cells"),
-)
-
 
 def _z(dt) -> str:
     return dt.strftime("%H%M") + "Z"
+
+
+class _HeightChart(FigureCanvasQTAgg):
+    """Echo-top height of the tracked storm across the event's volumes.
+
+    ``set_series`` redraws the whole trace (called once per selection);
+    ``set_marker`` just moves the vertical "current frame" line as the user
+    scrubs, so per-frame updates stay cheap.
+    """
+
+    def __init__(self) -> None:
+        self._fig = Figure(figsize=(4, 2.4), facecolor="#101010")
+        super().__init__(self._fig)
+        self._ax = self._fig.add_subplot(111)
+        self._times: list = []
+        self._marker = None
+        self._style_axes()
+
+    def _style_axes(self) -> None:
+        ax = self._ax
+        ax.set_facecolor("#101010")
+        for spine in ax.spines.values():
+            spine.set_color("#666")
+        ax.tick_params(colors="#ccc", labelsize=8)
+        ax.set_ylabel("echo top (km AGL)", color="#ccc", fontsize=9)
+        ax.grid(True, color="#333", linewidth=0.5)
+
+    def set_series(self, times: list, heights: list, title: str = "") -> None:
+        """Draw the full trace.
+
+        ``times`` holds the valid time of every volume in the event; ``heights``
+        is the parallel echo-top (km AGL) for the tracked cell in each volume,
+        with ``None`` where the storm is absent from that volume.
+        """
+        self._times = list(times)
+        self._marker = None
+        ax = self._ax
+        ax.clear()
+        self._style_axes()
+        if title:
+            ax.set_title(title, color="#ccc", fontsize=9)
+        xs = [i for i, h in enumerate(heights) if h is not None]
+        ys = [h for h in heights if h is not None]
+        if xs:
+            ax.plot(xs, ys, "-o", color="#3fb6ff", markersize=4, linewidth=1.5)
+            ax.set_ylim(0, max(ys) * 1.15 + 1)
+        n = len(self._times)
+        ax.set_xlim(-0.5, max(n - 1, 0) + 0.5)
+        if n:
+            step = max(1, n // 8)
+            ticks = list(range(0, n, step))
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([_z(self._times[i]) for i in ticks])
+        try:
+            self._fig.tight_layout()
+        except Exception:  # noqa: BLE001
+            pass
+        self.draw_idle()
+
+    def set_marker(self, index: int) -> None:
+        """Move the current-frame line to the volume at ``index``."""
+        if self._marker is not None:
+            try:
+                self._marker.remove()
+            except Exception:  # noqa: BLE001
+                pass
+            self._marker = None
+        if 0 <= index < len(self._times):
+            self._marker = self._ax.axvline(index, color="#ff5050", linewidth=1.4)
+        self.draw_idle()
 
 
 class _GridSignals(QObject):
@@ -110,38 +174,21 @@ class ModelPane(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Toolbar (3D layer toggles).
-        bar = QWidget()
-        bar_l = QHBoxLayout(bar)
-        bar_l.setContentsMargins(4, 2, 4, 2)
-        bar_l.setSpacing(4)
-        self._toggle_btns: dict[str, QToolButton] = {}
-        for key, label in _TOGGLES:
-            btn = QToolButton()
-            btn.setText(label)
-            btn.setCheckable(True)
-            btn.setChecked(True)
-            btn.toggled.connect(lambda on, k=key: self._on_toggle(k, on))
-            bar_l.addWidget(btn)
-            self._toggle_btns[key] = btn
-        bar_l.addStretch(1)
-        layout.addWidget(bar)
-
-        # Vertical split: 3D on top, cross-section + scrubber below.
+        # Vertical split: echo-top height chart on top, cross-section +
+        # scrubber below.
         split = QSplitter(Qt.Vertical)
-        self.plotter = QtInteractor(self, off_screen=off_screen)
+        self._chart = _HeightChart()
         self.xplotter = QtInteractor(self, off_screen=off_screen)
-        for p in (self.plotter, self.xplotter):
-            if off_screen:
-                try:
-                    p.ren_win.SetSize(1024, 768)
-                except Exception:  # noqa: BLE001
-                    pass
+        if off_screen:
             try:
-                p.set_background("black")
-            except Exception as e:  # noqa: BLE001
-                log.info("model.init_render_skipped", reason=str(e).splitlines()[0])
-        split.addWidget(self.plotter.interactor)
+                self.xplotter.ren_win.SetSize(1024, 768)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            self.xplotter.set_background("black")
+        except Exception as e:  # noqa: BLE001
+            log.info("model.init_render_skipped", reason=str(e).splitlines()[0])
+        split.addWidget(self._chart)
         split.addWidget(self._build_xsection_panel())
         split.setSizes([560, 340])
         self.split = split
@@ -153,15 +200,12 @@ class ModelPane(QWidget):
         self._grid_signals.ready.connect(self._on_grid_ready)
         self._grid_signals.failed.connect(self._on_grid_failed)
         self._req_id = 0
-        self._pending_reset_cam = True
         self._pending_focus: StormCell | None = None
-        self._cam_initialised = False
 
         self._provider: GridProvider | None = None
         self._results: list = []
         self._cells_by_time: dict[str, list[StormCell]] = {}
         self._selected_cell: StormCell | None = None
-        self._scene: scene_builder.SceneActors | None = None
 
         # Play timer for the scrubber.
         self._play_timer = QTimer(self)
@@ -215,12 +259,12 @@ class ModelPane(QWidget):
             )
         # Rebuild the current frame so changes (iso levels, vert exag…) show.
         if self._provider is not None and len(self._provider):
-            self._request_index(self._slider.value(), reset_cam=False)
+            self._request_index(self._slider.value())
 
     # --- selection wiring -------------------------------------------------
 
     def show_cell(self, cell: StormCell, results: list, source_factory=None) -> None:
-        """Build the 3D scene + cross-section for ``cell`` and arm the scrubber.
+        """Build the height chart + cross-section for ``cell`` and arm the scrubber.
 
         ``results`` is the ordered list of ``VolumeResult`` for the warning;
         ``source_factory`` (optional) re-grids any volume evicted from the LRU
@@ -233,7 +277,7 @@ class ModelPane(QWidget):
             res.volume.valid_time.isoformat(): list(res.cells) for res in self._results
         }
         self._selected_cell = cell
-        self._cam_initialised = False
+        self._build_chart(cell)
 
         # Retain every already-gridded frame of this warning (they are already
         # in RAM via ``results``), so scrubbing within the event never re-grids;
@@ -250,12 +294,34 @@ class ModelPane(QWidget):
         self._slider.setMaximum(max(0, len(provider) - 1))
         self._slider.setValue(idx)
         self._slider.blockSignals(False)
-        self._request_index(idx, reset_cam=True, focus_cell=cell)
+        self._request_index(idx, focus_cell=cell)
+
+    def _build_chart(self, cell: StormCell) -> None:
+        """Trace ``cell``'s echo-top height across every volume in the event.
+
+        Follows the same track (``track_id``) the cross-section and emphasis
+        logic use; volumes where that track is absent leave a gap in the trace.
+        Falls back to the clicked cell's own volume when it was never tracked.
+        """
+        tid = cell.track_id
+        times: list = []
+        heights: list = []
+        for res in self._results:
+            times.append(res.volume.valid_time)
+            match: StormCell | None = None
+            if tid >= 0:
+                match = next((c for c in res.cells if c.track_id == tid), None)
+            if match is None and res.volume.valid_time == cell.valid_time:
+                match = next(
+                    (c for c in res.cells if c.cell_id == cell.cell_id), None
+                )
+            heights.append(match.echo_top_km if match is not None else None)
+        self._chart.set_series(times, heights, title=f"Track {tid}" if tid >= 0 else "")
 
     # --- scrubber controls ------------------------------------------------
 
     def _on_slider(self, value: int) -> None:
-        self._request_index(value, reset_cam=False)
+        self._request_index(value)
 
     def _step(self, delta: int) -> None:
         self._play_timer.stop()
@@ -287,13 +353,12 @@ class ModelPane(QWidget):
     # --- threaded grid load + build --------------------------------------
 
     def _request_index(
-        self, index: int, reset_cam: bool, focus_cell: StormCell | None = None
+        self, index: int, focus_cell: StormCell | None = None
     ) -> None:
         if self._provider is None or len(self._provider) == 0:
             return
         index = max(0, min(index, len(self._provider) - 1))
         self._req_id += 1
-        self._pending_reset_cam = reset_cam
         self._pending_focus = focus_cell
         task = _GridLoadTask(self._provider, index, self._req_id, self._grid_signals)
         self._pool.start(task)
@@ -307,10 +372,10 @@ class ModelPane(QWidget):
         if emphasis is None:
             return
         self._selected_cell = emphasis
-        self._build_3d(volume, emphasis, cells, reset_cam=self._pending_reset_cam)
+        self._chart.set_marker(self._provider.index_of(volume.valid_time))
         self._build_xsection(volume, emphasis)
         self._time_label.setText(_z(volume.valid_time))
-        # Drive the map in lock-step with this 3D frame (radar + cells follow).
+        # Drive the map in lock-step with this frame (radar + cells follow).
         self.frame_ready.emit(volume, emphasis, cells)
 
     @Slot(int, str)
@@ -337,59 +402,6 @@ class ModelPane(QWidget):
             return max(cells, key=lambda c: c.max_dbz)
         return focus
 
-    def _build_3d(self, volume, cell: StormCell, cells: list[StormCell],
-                  reset_cam: bool) -> None:
-        log.info("model.build_3d.begin", valid_time=volume.valid_time.isoformat(),
-                 cell_id=cell.cell_id, n_cells=len(cells), reset_cam=reset_cam)
-        toggles = {k: b.isChecked() for k, b in self._toggle_btns.items()}
-        try:
-            self.plotter.clear()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            self._scene = scene_builder.build_scene(
-                self.plotter, volume, cell, self._viewer,
-                other_cells=cells, toggles=toggles,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.info("model.build_skipped", reason=str(e).splitlines()[0])
-            return
-        self._frame_axes(volume)
-        try:
-            # Keep the camera fixed between scrub frames so the storm evolves in
-            # place; only frame it on a fresh selection.
-            if reset_cam or not self._cam_initialised:
-                self.plotter.view_isometric()
-                self._frame_camera_on_cell(volume, cell)
-                self._cam_initialised = True
-            if self._allow_render:
-                self.plotter.render()
-        except Exception as e:  # noqa: BLE001
-            log.info("model.render_skipped", reason=str(e).splitlines()[0])
-        log.info("model.build_3d.done", cell_id=cell.cell_id)
-
-    def _frame_camera_on_cell(self, volume, cell: StormCell) -> None:
-        """Frame the isometric camera on the selected cell, not the whole domain.
-
-        ``view_isometric`` fits *every* actor — including the faint other-cell
-        prisms scattered across the 300 km grid — which shrinks the storm of
-        interest into a corner. Reset to a bounding box around just this cell's
-        ROI (its footprint + padding, ground to echo top) so it sits centred.
-        """
-        from ..viz.scene_builder import roi_window_km
-
-        ve = self._viewer.vert_exag
-        w = roi_window_km(volume, cell)
-        cx, cy = cell.seed_x / 1000.0, cell.seed_y / 1000.0
-        ztop = max(cell.echo_top_km, 0.1) * ve
-        bounds = (cx - w, cx + w, cy - w, cy + w, 0.0, ztop)
-        try:
-            self.plotter.reset_camera(bounds=bounds)
-            self.plotter.camera.zoom(1.1)
-        except Exception as e:  # noqa: BLE001
-            log.info("model.frame_skipped", reason=str(e).splitlines()[0])
-            self.plotter.camera.zoom(1.4)
-
     def _build_xsection(self, volume, cell: StormCell) -> None:
         log.info("model.build_xsection.begin", cell_id=cell.cell_id)
         try:
@@ -404,24 +416,3 @@ class ModelPane(QWidget):
         except Exception as e:  # noqa: BLE001
             log.info("model.xsection_skipped", reason=str(e).splitlines()[0])
         log.info("model.build_xsection.done", cell_id=cell.cell_id)
-
-    def _frame_axes(self, volume) -> None:
-        ve = self._viewer.vert_exag
-        try:
-            self.plotter.show_bounds(
-                xtitle="x (km E)", ytitle="y (km N)",
-                ztitle=f"z (km AGL x{ve:g})", color="gray",
-            )
-        except Exception as e:  # noqa: BLE001
-            log.info("model.axes_skipped", reason=str(e).splitlines()[0])
-
-    # --- toolbar ----------------------------------------------------------
-
-    def _on_toggle(self, layer: str, on: bool) -> None:
-        if self._scene is not None:
-            self._scene.set_visible(layer, on)
-            try:
-                if self._allow_render:
-                    self.plotter.render()
-            except Exception:  # noqa: BLE001
-                pass

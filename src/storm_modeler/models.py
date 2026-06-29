@@ -230,3 +230,93 @@ class GriddedVolume:
             lon0=float(d["lon0"]),
             products=products,
         )
+
+
+@dataclass
+class SatelliteScene:
+    """One GOES ABI Band-13 brightness-temperature scene on a lon/lat raster.
+
+    Unlike :class:`GriddedVolume` (azimuthal-equidistant local metres centred on
+    a radar), a scene is stored already reprojected onto a *regular* lon/lat
+    grid: ``bt[j, i]`` is the cloud-top brightness temperature (Kelvin, NaN
+    off-disk) at ``lons[i]`` / ``lats[j]``. ``lats`` runs north→south (row 0 =
+    north), matching the raster convention ``radar_render.product_lonlat_image``
+    uses, so the BT colorizer and the Leaflet image overlay reuse that shape and
+    cloud-top detection is a pure index→lon/lat lookup (no pyproj at detect
+    time). Produced by :class:`storm_modeler.data.satellite.ABISource` (the
+    reprojection happens once, on the worker, without pyproj) or read from a
+    fixture ``*.npz``.
+    """
+
+    satellite: str  # e.g. "GOES-19"
+    band: int  # 13 (Clean IR)
+    valid_time: datetime
+    bt: np.ndarray  # (nlat, nlon) brightness temperature, Kelvin, NaN off-disk
+    lons: np.ndarray  # (nlon,) ascending
+    lats: np.ndarray  # (nlat,) descending (row 0 = north)
+    bbox: tuple[float, float, float, float]  # (lon_min, lat_min, lon_max, lat_max)
+
+    def __post_init__(self) -> None:
+        self.valid_time = _parse_dt(self.valid_time)
+        self.band = int(self.band)
+        self.bt = np.asarray(self.bt, dtype=np.float32)
+        self.lons = np.asarray(self.lons, dtype=np.float64)
+        self.lats = np.asarray(self.lats, dtype=np.float64)
+        self.bbox = tuple(float(v) for v in self.bbox)  # type: ignore[assignment]
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.bt.shape
+
+    @property
+    def dlon_km(self) -> float:
+        """Mean east-west pixel spacing in km at the scene's centre latitude."""
+        if self.lons.size < 2:
+            return 1.0
+        lat_c = float(np.mean(self.lats)) if self.lats.size else 0.0
+        deg = float(np.mean(np.abs(np.diff(self.lons))))
+        return deg * 111.32 * float(np.cos(np.radians(lat_c)))
+
+    @property
+    def dlat_km(self) -> float:
+        """Mean north-south pixel spacing in km."""
+        if self.lats.size < 2:
+            return 1.0
+        return float(np.mean(np.abs(np.diff(self.lats)))) * 110.57
+
+    def geo_bounds(self) -> tuple[float, float, float, float]:
+        """(lat_min, lon_min, lat_max, lon_max) for a Leaflet image overlay."""
+        return (
+            float(self.lats.min()),
+            float(self.lons.min()),
+            float(self.lats.max()),
+            float(self.lons.max()),
+        )
+
+    # --- (de)serialisation for fixtures / cache ---------------------------
+
+    def save_npz(self, path: str | Path) -> None:
+        np.savez_compressed(
+            path,
+            satellite=self.satellite,
+            band=self.band,
+            valid_time=self.valid_time.isoformat(),
+            bt=self.bt,
+            lons=self.lons,
+            lats=self.lats,
+            bbox=np.asarray(self.bbox, dtype=np.float64),
+        )
+
+    @classmethod
+    def load_npz(cls, path: str | Path) -> "SatelliteScene":
+        d = np.load(path, allow_pickle=False)
+        bbox = tuple(float(v) for v in d["bbox"])
+        return cls(
+            satellite=str(d["satellite"]),
+            band=int(d["band"]),
+            valid_time=str(d["valid_time"]),
+            bt=d["bt"],
+            lons=d["lons"],
+            lats=d["lats"],
+            bbox=bbox,  # type: ignore[arg-type]
+        )

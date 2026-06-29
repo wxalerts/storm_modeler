@@ -12,6 +12,11 @@ Protocol: one JSON object per line on stdin. Commands:
     {"cmd": "warning",   "geojson": {...}}
     {"cmd": "cells",     "geojson": {...}}
     {"cmd": "highlight", "geojson": {...}}
+    {"cmd": "lightning", "points": [[lat, lon, t_frac], ...]}  # GLM flashes
+    {"cmd": "lightning_clear"}
+    {"cmd": "satellite", "url": "data:image/png;base64,...", "bounds": [[s,w],[n,e]]}
+    {"cmd": "satellite_clear"}
+    {"cmd": "cloudtops",  "geojson": {...}}  # cloud-top cells (anvil/OT markers)
     {"cmd": "fit",       "bounds": [[s,w],[n,e]]}
     {"cmd": "clear"}
     {"cmd": "snapshot",  "path": "/tmp/x.png"}   # test aid
@@ -20,6 +25,7 @@ Prints ``MAP_READY`` to stdout once the page has loaded.
 
 import json
 import os
+import signal
 import sys
 
 # XWayland + WebKit software compositing: no GDK GL context needed (it fails
@@ -50,7 +56,10 @@ L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/
             {maxZoom:18}).addTo(map);
 L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
             {maxZoom:18}).addTo(map);
-var radarLayer=null, warningLayer=null, cellsLayer=null, hiLayer=null;
+var radarLayer=null, warningLayer=null, cellsLayer=null, hiLayer=null, lightningLayer=null;
+var satLayer=null, cloudtopLayer=null;
+// Canvas renderer: thousands of flash markers paint far faster than SVG.
+var lightningCanvas = L.canvas({padding:0.5});
 function setRadar(url, b){ if(radarLayer)map.removeLayer(radarLayer);
   radarLayer=L.imageOverlay(url,b,{opacity:0.7}).addTo(map);}
 function setWarning(gj){ if(warningLayer)map.removeLayer(warningLayer);
@@ -59,11 +68,41 @@ function setCells(gj){ if(cellsLayer)map.removeLayer(cellsLayer);
   cellsLayer=L.geoJSON(gj,{style:{color:'#ff0',weight:2,fill:false}}).addTo(map);}
 function highlightCell(gj){ if(hiLayer)map.removeLayer(hiLayer);
   hiLayer=L.geoJSON(gj,{style:{color:'#fff',weight:4,fill:false}}).addTo(map);}
+// GLM flashes: small dots ramped oldest(blue)->newest(red) by time fraction.
+function setLightning(pts){ if(lightningLayer)map.removeLayer(lightningLayer);
+  if(!pts||!pts.length){lightningLayer=null;return;}
+  var ms=pts.map(function(p){var hue=Math.round(240*(1-p[2]));
+    return L.circleMarker([p[0],p[1]],{renderer:lightningCanvas,radius:3,
+      stroke:false,fillColor:'hsl('+hue+',100%,55%)',fillOpacity:0.85});});
+  lightningLayer=L.layerGroup(ms).addTo(map);}
+function clearLightning(){ if(lightningLayer)map.removeLayer(lightningLayer);
+  lightningLayer=null;}
+// GOES ABI Band-13 brightness temperature: a translucent image overlay under
+// the cloud-top markers (sits above radar so cold tops read on the IR).
+function setSatellite(url,b){ if(satLayer)map.removeLayer(satLayer);
+  satLayer=L.imageOverlay(url,b,{opacity:0.55}).addTo(map);}
+function clearSatellite(){ if(satLayer)map.removeLayer(satLayer); satLayer=null;
+  if(cloudtopLayer)map.removeLayer(cloudtopLayer); cloudtopLayer=null;}
+// Cloud-top cells: anvil/footprint polygons + coldest-pixel markers (overshooting
+// tops magenta + larger, cores cyan). Popups carry BT and storm tilt.
+function setCloudtops(gj){ if(cloudtopLayer)map.removeLayer(cloudtopLayer);
+  cloudtopLayer=L.geoJSON(gj,{
+    pointToLayer:function(f,ll){var ot=f.properties.kind==='ot';
+      return L.circleMarker(ll,{radius:ot?7:4,
+        color:ot?'#f0f':'#0ff',weight:2,fillOpacity:0.55});},
+    style:function(f){return {color:f.properties.kind==='anvil'?'#88f':'#0cf',
+      weight:1.5,fill:false};},
+    onEachFeature:function(f,l){var p=f.properties;var s='BT '+p.min_bt_k+' K';
+      if(p.tilt_km!==undefined)s+=' · tilt '+p.tilt_km+' km @ '+p.tilt_bearing_deg+'°';
+      l.bindPopup(s);}
+  }).addTo(map);}
 function fitBounds(b){ map.fitBounds(b,{padding:[25,25], animate:false}); }
 function panTo(lat, lon){ map.panTo([lat,lon],{animate:false}); }
 function setProduct(p){ document.getElementById('prod').textContent = p; }
-function clearAll(){ [radarLayer,warningLayer,cellsLayer,hiLayer].forEach(
-  function(l){if(l)map.removeLayer(l);}); radarLayer=warningLayer=cellsLayer=hiLayer=null;}
+function clearAll(){ [radarLayer,warningLayer,cellsLayer,hiLayer,lightningLayer,
+  satLayer,cloudtopLayer].forEach(function(l){if(l)map.removeLayer(l);});
+  radarLayer=warningLayer=cellsLayer=hiLayer=lightningLayer=null;
+  satLayer=cloudtopLayer=null;}
 </script></body></html>"""
 
 
@@ -141,6 +180,16 @@ class MapApp:
             self._js(f"setCells({json.dumps(msg['geojson'])});")
         elif cmd == "highlight":
             self._js(f"highlightCell({json.dumps(msg['geojson'])});")
+        elif cmd == "lightning":
+            self._js(f"setLightning({json.dumps(msg.get('points', []))});")
+        elif cmd == "lightning_clear":
+            self._js("clearLightning();")
+        elif cmd == "satellite":
+            self._js(f"setSatellite({json.dumps(msg['url'])}, {json.dumps(msg['bounds'])});")
+        elif cmd == "satellite_clear":
+            self._js("clearSatellite();")
+        elif cmd == "cloudtops":
+            self._js(f"setCloudtops({json.dumps(msg['geojson'])});")
         elif cmd == "fit":
             self._js(f"fitBounds({json.dumps(msg['bounds'])});")
         elif cmd == "pan":
@@ -166,12 +215,30 @@ class MapApp:
 def main() -> None:
     app = MapApp()
 
+    def _shutdown(*_a) -> bool:
+        # Single graceful exit path: persist window geometry, then quit. Used by
+        # both stdin-EOF and the SIGTERM/SIGINT handlers below.
+        _save_geom(app.win)
+        Gtk.main_quit()
+        return False  # one-shot: remove the GLib source
+
+    # The parent reaps us with SIGTERM on app exit (see MapClient.shutdown).
+    # The OS default for SIGTERM would kill us *before* the stdin-EOF watch runs,
+    # losing the geometry — so route both signals through the GLib main loop so
+    # geometry is written first. (Plain signal.signal won't fire promptly while
+    # blocked in the C-level Gtk.main(); GLib.unix_signal_add integrates it.)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, _shutdown)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, _shutdown)
+
     def on_stdin(fd, condition):
+        # IO_HUP fires when the parent closes the pipe with no pending data; must
+        # be handled (and watched) explicitly — a plain IO_IN watch never wakes on
+        # hangup, so the EOF-save path silently never ran.
+        if condition & GLib.IO_HUP:
+            return _shutdown()
         line = sys.stdin.readline()
         if not line:  # EOF: parent closed the pipe → save geometry and exit
-            _save_geom(app.win)
-            Gtk.main_quit()
-            return False
+            return _shutdown()
         line = line.strip()
         if line:
             try:
@@ -180,7 +247,7 @@ def main() -> None:
                 sys.stderr.write(f"bad command: {e}\n")
         return True
 
-    GLib.io_add_watch(sys.stdin.fileno(), GLib.IO_IN, on_stdin)
+    GLib.io_add_watch(sys.stdin.fileno(), GLib.IO_IN | GLib.IO_HUP, on_stdin)
     Gtk.main()
 
 

@@ -20,7 +20,13 @@ from pathlib import Path
 
 import structlog
 
-from .config import local_settings_path, pg_dsn
+from .config import (
+    IEM_SEARCH_MODULES,
+    LIVE_EXTRA_HINT,
+    local_settings_path,
+    missing_modules,
+    pg_dsn,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -70,10 +76,12 @@ def _build_window(persist: bool):
     from .panes.left_search import LeftSearchPane
     from .panes.left_volumes import LeftVolumesPane
     from .panes.map_client import MapClient
+    from .panes.lightning_window import LightningWindow
     from .panes.logs_window import LogsWindow
     from .panes.model_view import ModelPane
+    from .panes.satellite_pane import SatelliteWindow
     from .settings.resolver import resolve
-    from .workers import SearchWorker, WarningWorker
+    from .workers import LightningWorker, SatelliteWorker, SearchWorker, WarningWorker
 
     class MainWindow(QMainWindow):
         def __init__(self) -> None:
@@ -96,6 +104,17 @@ def _build_window(persist: bool):
             self._sources: dict[str, object] = {}   # warning.id -> () -> VolumeSource
             self._results: dict[str, list] = {}      # warning.id -> [VolumeResult]
             self._selected_id: str | None = None
+            # GLM lightning for the selected warning: all fetched flashes, their
+            # full time span (for a stable colour ramp), and the valid_time of
+            # the volume currently on the map (so only that volume's strikes show
+            # and advance in lock-step with playback).
+            self._lightning_flashes: list = []
+            self._lightning_span: tuple[float, float] | None = None
+            self._current_valid_time = None
+            # Satellite cloud-top state for the selected warning.
+            self._sat_results: list = []
+            self._sat_tracker = None
+            self._sat_persistence = None
             # On-disk cache of downloaded warnings (volumes + metadata) so the
             # "Downloaded" list and its data survive app restarts.
             self.downloads = DownloadStore()
@@ -127,10 +146,18 @@ def _build_window(persist: bool):
             from .logging_setup import current_log_path
             self.logs_window = LogsWindow(current_log_path())
 
+            # Lightning window (fetches GOES GLM flashes onto the map).
+            self.lightning_window = LightningWindow()
+
+            # Satellite window (fetches GOES ABI cloud-top analysis onto the map).
+            self.satellite_window = SatelliteWindow()
+
             # Persisted window geometry (position + size) across launches.
             self._geo = QSettings("WxAlerts", "StormModeler")
             self._geo_windows = {
                 "data": self, "model": self.model_window, "logs": self.logs_window,
+                "lightning": self.lightning_window,
+                "satellite": self.satellite_window,
             }
 
             self.setStatusBar(QStatusBar())
@@ -140,7 +167,7 @@ def _build_window(persist: bool):
             # Record the 3D pane's VTK GL context — the first thing to inspect
             # if a render crashes on this display stack.
             from .logging_setup import log_gl_info
-            log_gl_info(self.model.plotter, where="model3d")
+            log_gl_info(self.model.xplotter, where="model_xsection")
 
             # Wiring.
             self.search.search_requested.connect(self.on_search)
@@ -151,6 +178,10 @@ def _build_window(persist: bool):
             # for each frame (incl. playback), which drives the map in lock-step.
             self.volumes.storm_selected.connect(self._on_storm)
             self.model.frame_ready.connect(self._on_model_frame)
+            self.lightning_window.fetch_requested.connect(self.on_fetch_lightning)
+            self.lightning_window.clear_requested.connect(self.map.clear_lightning)
+            self.satellite_window.fetch_requested.connect(self.on_fetch_satellite)
+            self.satellite_window.clear_requested.connect(self.map.clear_satellite)
 
             # Repopulate the "Downloaded" list from the on-disk cache.
             self._load_persisted_downloads()
@@ -182,6 +213,10 @@ def _build_window(persist: bool):
             win_menu = self.menuBar().addMenu("&Windows")
             win_menu.addAction("3D View").triggered.connect(
                 lambda: self._raise_window(self.model_window))
+            win_menu.addAction("Lightning").triggered.connect(
+                lambda: self._raise_window(self.lightning_window))
+            win_menu.addAction("Satellite").triggered.connect(
+                lambda: self._raise_window(self.satellite_window))
             win_menu.addAction("Logs").triggered.connect(
                 lambda: self._raise_window(self.logs_window))
 
@@ -229,6 +264,8 @@ def _build_window(persist: bool):
                 self.move(40, 60)
                 self.model_window.move(500, 60)
                 self.logs_window.move(500, 600)
+                self.lightning_window.move(40, 620)
+                self.satellite_window.move(40, 880)
             else:
                 for name, win in self._geo_windows.items():
                     g = self._geo.value(f"geometry/{name}")
@@ -236,6 +273,8 @@ def _build_window(persist: bool):
                         win.restoreGeometry(g)
             self.model_window.show()
             self.logs_window.show()
+            self.lightning_window.show()
+            self.satellite_window.show()
 
         def _save_geometry(self) -> None:
             for name, win in self._geo_windows.items():
@@ -248,6 +287,8 @@ def _build_window(persist: bool):
             self.map.shutdown()
             self.model_window.close()
             self.logs_window.close()
+            self.lightning_window.close()
+            self.satellite_window.close()
             from PySide6.QtWidgets import QApplication
             QApplication.instance().quit()
             super().closeEvent(event)
@@ -273,6 +314,13 @@ def _build_window(persist: bool):
                          + (["SV"] if params.severe else []))
             if not phenomena:
                 self.statusBar().showMessage("Select at least one event type.")
+                return
+            missing = missing_modules(IEM_SEARCH_MODULES)
+            if missing:
+                self.statusBar().showMessage(
+                    f"IEM search needs the live extra ({', '.join(missing)} "
+                    f"missing) — {LIVE_EXTRA_HINT}"
+                )
                 return
             self.search.set_searching(True)
             worker = SearchWorker(
@@ -301,6 +349,12 @@ def _build_window(persist: bool):
             self._selected_id = warning.id
             self.volumes.set_warning(warning)
             self.map.show_warning(warning)
+            # Arm the lightning + satellite windows for this warning and drop any
+            # overlays/state left over from the previous one.
+            self.lightning_window.set_warning(warning)
+            self._reset_lightning()
+            self.satellite_window.set_warning(warning)
+            self._reset_satellite()
             for res in self._results.get(warning.id, []):
                 self.volumes.add_result(res)
             self.statusBar().showMessage(f"Selected {warning.event} ETN {warning.etn:04d}")
@@ -331,6 +385,10 @@ def _build_window(persist: bool):
             self._results[warning.id] = []
             self.volumes.set_warning(warning)
             self.map.show_warning(warning)
+            self.lightning_window.set_warning(warning)
+            self._reset_lightning()
+            self.satellite_window.set_warning(warning)
+            self._reset_satellite()
 
             log.info("download.start", warning=warning.id, event_name=warning.event,
                      site=site.icao, issued=warning.issued.isoformat(),
@@ -360,6 +418,11 @@ def _build_window(persist: bool):
             worker.signals.error.connect(self._on_error)
             worker.signals.finished.connect(dialog.finish)
             worker.signals.finished.connect(self._close_download_persistence)
+            # Optionally chain a GOES cloud-top pull once all volumes are in
+            # (off by default; see the sat_auto_fetch setting).
+            worker.signals.finished.connect(
+                lambda w=warning: self._maybe_auto_satellite(w)
+            )
             # Record it in the session "Downloaded" list once volumes are in.
             worker.signals.warning_done.connect(self.search.add_downloaded)
             dialog.cancel_requested.connect(worker.request_cancel)
@@ -433,6 +496,7 @@ def _build_window(persist: bool):
             if res.warning.id == self._selected_id:
                 self.volumes.add_result(res)
                 self.map.show_result(res.warning, res.volume, res.cells)
+                self._show_lightning_for(res.volume)
             self.statusBar().showMessage(
                 f"{res.warning.event}  {res.volume.valid_time:%H%MZ}  "
                 f"{res.index}/{res.total}  {len(res.cells)} cell(s)"
@@ -458,10 +522,237 @@ def _build_window(persist: bool):
             """3D pane produced a frame (selection or playback) — sync the map."""
             if getattr(self, "_map_warning", None) is not None:
                 self.map.show_cell_selection(self._map_warning, volume, cells, cell)
+                self._show_lightning_for(volume)
 
         def _on_error(self, msg: str) -> None:
             log.error("worker.error", msg=msg)
             self.statusBar().showMessage("Error: " + msg.splitlines()[0])
+
+        # --- lightning ----------------------------------------------------
+
+        def on_fetch_lightning(self, warning) -> None:
+            """Pull GOES GLM flashes for *warning*'s window onto the map."""
+            from .config import LIGHTNING_MODULES
+            from .data.lightning import bucket_for_date
+            from .data.volumes import bounded_window
+
+            missing = missing_modules(LIGHTNING_MODULES)
+            if missing:
+                self.lightning_window.set_busy(False)
+                self.lightning_window.set_status(
+                    f"Lightning needs the live extra ({', '.join(missing)} "
+                    f"missing) — {LIVE_EXTRA_HINT}"
+                )
+                return
+
+            w0, w1 = bounded_window(
+                warning.issued, warning.expires,
+                self.settings.pre_minutes, self.settings.post_minutes,
+            )
+            lon0, lat0, lon1, lat1 = warning.polygon.bounds
+            pad = float(self.settings.get("lightning_bbox_pad_deg", 0.5))
+            bbox = (lat0 - pad, lon0 - pad, lat1 + pad, lon1 + pad)
+            bucket, sat = bucket_for_date(w0.date())
+            log.info("lightning.fetch", warning=warning.id, bucket=bucket,
+                     start=w0.isoformat(), end=w1.isoformat())
+            self.lightning_window.set_status(f"{sat}: {w0:%H:%MZ}–{w1:%H:%MZ}…")
+
+            cancel = threading.Event()
+            worker = LightningWorker(
+                w0, w1, bbox, bucket=bucket,
+                max_flashes=int(self.settings.get("lightning_max_flashes", 5000)),
+                good_only=bool(self.settings.get("lightning_quality_good_only", True)),
+                cancel=cancel,
+            )
+            worker.signals.status.connect(self.lightning_window.set_status)
+            worker.signals.flashes.connect(self._on_lightning)
+            worker.signals.error.connect(
+                lambda m: self.lightning_window.set_status("Error: " + m.splitlines()[0])
+            )
+            worker.signals.finished.connect(lambda: self.lightning_window.set_busy(False))
+            self._workers.append(worker)
+            self.pool.start(worker)
+
+        def _on_lightning(self, flashes) -> None:
+            """Store the event's flashes; show only the current volume's slice."""
+            self._lightning_flashes = list(flashes)
+            if flashes:
+                times = [f.time for f in flashes]
+                self._lightning_span = (min(times).timestamp(), max(times).timestamp())
+                self.lightning_window.set_time_range(min(times), max(times))
+            else:
+                self._lightning_span = None
+                self.lightning_window.set_time_range(None, None)
+            if self._current_valid_time is None:
+                vts = sorted(r.volume.valid_time
+                             for r in self._results.get(self._selected_id, []))
+                self._current_valid_time = vts[0] if vts else None
+            self._refresh_lightning()
+
+        def _show_lightning_for(self, volume) -> None:
+            """Remember the volume now on the map and refresh its strike layer."""
+            self._current_valid_time = volume.valid_time
+            if self._lightning_flashes:
+                self._refresh_lightning()
+
+        def _refresh_lightning(self) -> None:
+            total = len(self._lightning_flashes)
+            if not total or self._current_valid_time is None:
+                self.map.clear_lightning()
+                self.lightning_window.set_count(0, total=total)
+                return
+            subset = self._lightning_for_volume(self._current_valid_time)
+            self.map.show_lightning(subset, span=self._lightning_span)
+            self.lightning_window.set_count(len(subset), total=total)
+
+        def _lightning_for_volume(self, valid_time) -> list:
+            from .data.lightning import bin_nearest
+
+            volume_times = [r.volume.valid_time
+                            for r in self._results.get(self._selected_id, [])]
+            return bin_nearest(self._lightning_flashes, valid_time, volume_times)
+
+        def _reset_lightning(self) -> None:
+            self._lightning_flashes = []
+            self._lightning_span = None
+            self._current_valid_time = None
+            self.map.clear_lightning()
+
+        # --- satellite (GOES ABI cloud tops) ------------------------------
+
+        def _reset_satellite(self) -> None:
+            self._sat_results = []  # [(SatelliteScene, list[CloudTopCell])]
+            self._sat_tracker = None
+            self._sat_persistence = None
+            self.map.clear_satellite()
+
+        def _maybe_auto_satellite(self, warning) -> None:
+            """Chain a cloud-top pull after a radar download, if enabled.
+
+            Off by default (``sat_auto_fetch``). Only fires for the warning still
+            selected, so background downloads don't hijack the view.
+            """
+            if not bool(self.settings.get("sat_auto_fetch", False)):
+                return
+            if warning.id != self._selected_id:
+                return
+            self.satellite_window.set_busy(True)
+            self.on_fetch_satellite(warning)
+
+        def on_fetch_satellite(self, warning) -> None:
+            """Ingest GOES ABI scenes for *warning*, detect cloud tops, overlay them."""
+            from .config import SATELLITE_MODULES
+            from .data.satellite import ABISource, satellite_for
+            from .data.volumes import bounded_window
+            from .detection.cloudtop import Tracker as CloudTopTracker
+
+            missing = missing_modules(SATELLITE_MODULES)
+            if missing:
+                self.satellite_window.set_busy(False)
+                self.satellite_window.set_status(
+                    f"Satellite needs the live extra ({', '.join(missing)} "
+                    f"missing) — {LIVE_EXTRA_HINT}"
+                )
+                return
+
+            w0, w1 = bounded_window(
+                warning.issued, warning.expires,
+                self.settings.pre_minutes, self.settings.post_minutes,
+            )
+            lon0, lat0, lon1, lat1 = warning.polygon.bounds
+            pad = self.settings.sat_bbox_pad_deg
+            bbox = (lon0 - pad, lat0 - pad, lon1 + pad, lat1 + pad)
+            _, label, short = satellite_for(warning.centroid[0], w0.date())
+            cparams = self.settings.cloudtop
+
+            self._sat_results = []
+            self._sat_tracker = CloudTopTracker(cparams)  # provenance holder
+            self._sat_persistence = None
+            if self.dsn:
+                from .persist import Persistence
+                self._sat_persistence = Persistence(self.dsn)
+                self._sat_persistence.connect()
+                self._sat_persistence.upsert_warning(warning)
+            if not self._results.get(warning.id):
+                self.satellite_window.set_status(
+                    f"{label}: {w0:%H:%MZ}–{w1:%H:%MZ} — no radar yet, tilt skipped."
+                )
+            else:
+                self.satellite_window.set_status(f"{label}: {w0:%H:%MZ}–{w1:%H:%MZ}…")
+
+            log.info("satellite.fetch", warning=warning.id, satellite=short,
+                     start=w0.isoformat(), end=w1.isoformat())
+            cancel = threading.Event()
+            source = ABISource(
+                w0, w1, bbox, satellite=short,
+                target_res_deg=self.settings.sat_target_res_deg,
+            )
+            worker = SatelliteWorker(warning, source, cparams, cancel)
+            worker.signals.status.connect(self.satellite_window.set_status)
+            worker.signals.scene_ready.connect(self._on_scene)
+            worker.signals.error.connect(
+                lambda m: self.satellite_window.set_status("Error: " + m.splitlines()[0])
+            )
+            worker.signals.finished.connect(self._close_satellite_persistence)
+            worker.signals.finished.connect(lambda: self.satellite_window.set_busy(False))
+            self._workers.append(worker)
+            self.pool.start(worker)
+
+        def _close_satellite_persistence(self) -> None:
+            if getattr(self, "_sat_persistence", None) is not None:
+                self._sat_persistence.close()
+                self._sat_persistence = None
+
+        def _on_scene(self, warning, scene, cells, index, total) -> None:
+            """GUI-thread radar association + render + persist for one ABI scene.
+
+            The worker already detected and tracked the cloud-top cells; here we
+            tilt them against the nearest radar volume (which lives on this
+            thread) — which also annotates that volume's storms with cloud-top
+            temperature + OT — then cache, persist, refresh the listing, and
+            overlay the scene on the map.
+            """
+            from .detection.cloudtop import associate_radar
+
+            try:
+                self.downloads.save_warning(warning)
+                self.downloads.save_scene(warning.id, scene)
+            except Exception as e:  # noqa: BLE001 - caching must never break a run
+                log.error("gui.scene_cache_error", warning=warning.id, error=str(e))
+
+            radar = self._results.get(warning.id, [])
+            if radar:
+                radar_res = min(
+                    radar,
+                    key=lambda r: abs(
+                        (r.volume.valid_time - scene.valid_time).total_seconds()
+                    ),
+                )
+                associate_radar(cells, radar_res.cells, self._sat_tracker.params)
+                # The matched volume's storms now carry cloud-top temp + OT —
+                # refresh its row so the volume listing shows them.
+                if warning.id == self._selected_id:
+                    self.volumes.add_result(radar_res)
+
+            if getattr(self, "_sat_persistence", None) is not None:
+                try:
+                    self._sat_persistence.upsert_cloudtops(
+                        warning.id, warning.event, cells,
+                        self._sat_tracker.params.settings_hash,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.error("gui.scene_persist_error", warning=warning.id, error=str(e))
+
+            self._sat_results.append((scene, cells))
+            if warning.id == self._selected_id:
+                self.map.show_satellite(scene, cells)
+            n_cells = sum(len(c) for _, c in self._sat_results)
+            n_ot = sum(1 for _, c in self._sat_results for x in c if x.overshooting_top)
+            self.satellite_window.set_count(len(self._sat_results), n_cells, n_ot)
+            self.statusBar().showMessage(
+                f"{warning.event}  satellite {scene.valid_time:%H%MZ}  "
+                f"{index}/{total}  {len(cells)} cloud-top(s)"
+            )
 
     return MainWindow()
 
@@ -611,6 +902,7 @@ def run_smoke(args: argparse.Namespace) -> int:
         Path(tempfile.mkdtemp(prefix="sm_smoke_"))
     )
     resolver = SiteResolver()
+    last_warning = None
     for warning in FixtureWarningSource(fixture):
         window._sources[warning.id] = (lambda d: (lambda: FixtureVolumeSource(d)))(fixture)
         window.search.add_result(warning)
@@ -620,6 +912,26 @@ def run_smoke(args: argparse.Namespace) -> int:
             warning, FixtureVolumeSource(fixture), site, window.params,
             on_result=window._on_volume,
         )
+        last_warning = warning
+
+    # Drive the satellite path offscreen too: a synthetic cloud-top scene
+    # straight through _on_scene (radar association + map overlay + counts),
+    # proving the wiring and the map JSON without any network.
+    if last_warning is not None:
+        from .data.synthetic import make_cold_scene
+        from .detection.cloudtop import Tracker as CloudTopTracker, run as cloudtop_run
+        window._reset_satellite()
+        window._sat_tracker = CloudTopTracker(window.settings.cloudtop)
+        lon0, lat0, lon1, lat1 = last_warning.polygon.bounds
+        scene = make_cold_scene(
+            "GOES-19", last_warning.issued,
+            (lon0 - 0.3, lat0 - 0.3, lon1 + 0.3, lat1 + 0.3),
+            0.5 * (lon0 + lon1), 0.5 * (lat0 + lat1),
+        )
+        cells = cloudtop_run(scene, window.settings.cloudtop)
+        window._sat_tracker.update(cells, scene.valid_time)
+        window._on_scene(last_warning, scene, cells, 1, 1)
+        assert window._sat_results, "satellite scene did not register"
 
     # Instantiate the modal dialogs to prove they build (8B).
     settings_dlg = SettingsDialog(window.dsn, window.settings_path, window)
@@ -630,8 +942,8 @@ def run_smoke(args: argparse.Namespace) -> int:
 
     app.processEvents()
     print(
-        "smoke: panes (search, volumes, map, model) + settings/download dialogs "
-        "instantiated, fixture rendered — OK"
+        "smoke: panes (search, volumes, map, model, satellite) + settings/download "
+        "dialogs instantiated, fixture + cloud-top scene rendered — OK"
     )
     # The real smoke work is done. Reap the private Xvfb (if any) and hard-exit
     # 0: VTK/GL stacks can SIGABRT during interpreter teardown (a cosmetic

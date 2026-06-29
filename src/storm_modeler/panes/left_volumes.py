@@ -25,6 +25,20 @@ def _z(dt: datetime) -> str:
     return dt.strftime("%H%M") + "Z"
 
 
+def _cell_label(c: StormCell) -> str:
+    """One-line storm summary, with cloud-top temp + OT flag when available.
+
+    e.g. ``id 1  63.0 dBZ  depth 16.5 km  -20°C CT  OT`` — the CT/OT segments
+    appear only once a GOES ABI scene has been associated to the cell.
+    """
+    parts = [f"id {c.cell_id}", f"{c.max_dbz:.1f} dBZ", f"depth {c.depth_km:.1f} km"]
+    if c.cloud_top_c is not None:
+        parts.append(f"{c.cloud_top_c:.0f}°C CT")
+        if c.overshooting_top:
+            parts.append("OT")
+    return "  ".join(parts)
+
+
 class LeftVolumesPane(QWidget):
     storm_selected = Signal(object)  # StormCell
 
@@ -72,9 +86,7 @@ class LeftVolumesPane(QWidget):
         vol = self._volume_item(res)
         vol.removeRows(0, vol.rowCount())  # refresh on re-run
         for c in res.cells:
-            leaf = QStandardItem(
-                f"Storm  [id {c.cell_id}  {c.max_dbz:.1f} dBZ  depth {c.depth_km:.1f} km]"
-            )
+            leaf = QStandardItem(f"Storm  [{_cell_label(c)}]")
             leaf.setEditable(False)
             leaf.setData(c, CELL_ROLE)
             vol.appendRow(leaf)

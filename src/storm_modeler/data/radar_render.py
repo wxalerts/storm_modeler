@@ -58,6 +58,26 @@ def composite_rgba(volume: GriddedVolume) -> np.ndarray:
     return dbz_to_rgba(comp)
 
 
+def bt_to_rgba(bt_k: np.ndarray, vmin: float = 180.0, vmax: float = 300.0) -> np.ndarray:
+    """Map an IR brightness-temperature field (Kelvin) to (..., 4) uint8 RGBA.
+
+    Cold cloud tops read bright/saturated and warm scenes near-transparent, the
+    usual IR enhancement: a reversed ``turbo`` ramp over ``[vmin, vmax]`` (so the
+    coldest tops pop), with off-disk/NaN pixels fully transparent. Mirrors
+    ``_colorize``'s matplotlib branch.
+    """
+    import matplotlib
+
+    bt = np.asarray(bt_k, dtype=np.float32)
+    cmap = matplotlib.colormaps["turbo_r"]
+    norm = (bt - vmin) / (vmax - vmin)
+    rgba = (cmap(np.clip(norm, 0.0, 1.0)) * 255).astype(np.uint8)
+    finite = np.isfinite(bt)
+    rgba[..., 3] = np.where(finite, 255, 0)
+    rgba[~finite, :3] = 0
+    return rgba
+
+
 def radar_polydata(volume: GriddedVolume, z: float = 0.0):
     """A geo-aligned ``pyvista.StructuredGrid`` carrying per-point RGBA.
 
