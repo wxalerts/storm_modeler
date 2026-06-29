@@ -8,6 +8,7 @@ gridding), and the storm cells SCIT emits live in ``detection.detection_v2``.
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,15 @@ from pathlib import Path
 import numpy as np
 from pyproj import Transformer
 from shapely.geometry import Polygon, mapping, shape
+
+#: Serialises every pyproj/PROJ operation across threads. PROJ context creation
+#: is not concurrency-safe, and during a live download two threads use pyproj at
+#: once — the worker detecting a volume (StormCell seed lon/lat) while the GUI
+#: thread renders the previous volume's radar/cells. Doing both at the same
+#: instant intermittently segfaults in PROJ, so all transforms take this lock.
+#: Anything that builds a pyproj Transformer (scene/cross-section too) must use
+#: it. The work under the lock is microseconds, so contention is negligible.
+PROJ_LOCK = threading.Lock()
 
 
 def _parse_dt(value) -> datetime:
@@ -111,6 +121,11 @@ class GriddedVolume:
     z: np.ndarray  # (nz,) metres AGL
     lat0: float
     lon0: float
+    # 2D (ny, nx) display reductions per radar product, e.g. {"reflectivity":
+    # column-max, "velocity": lowest-tilt, …}. Reflectivity is kept in full 3D
+    # above (the 3D pane needs it); the other dual-pol moments are stored here
+    # as their 2D map layer only, to keep the on-disk cache small.
+    products: dict | None = None
 
     def __post_init__(self) -> None:
         self.valid_time = _parse_dt(self.valid_time)
@@ -118,6 +133,18 @@ class GriddedVolume:
         self.x = np.asarray(self.x, dtype=np.float64)
         self.y = np.asarray(self.y, dtype=np.float64)
         self.z = np.asarray(self.z, dtype=np.float64)
+        self.products = {k: np.asarray(v, dtype=np.float32)
+                         for k, v in (self.products or {}).items()}
+        # Reflectivity's 2D layer is always its composite (column max).
+        self.products.setdefault("reflectivity", self.composite_reflectivity())
+
+    def product_2d(self, name: str) -> np.ndarray | None:
+        """The 2D (ny, nx) display layer for ``name`` (None if not available)."""
+        return self.products.get(name)
+
+    @property
+    def available_products(self) -> list[str]:
+        return list(self.products.keys())
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -144,8 +171,23 @@ class GriddedVolume:
         return Transformer.from_crs(aeqd, "EPSG:4326", always_xy=True)
 
     def xy_to_lonlat(self, xm: np.ndarray, ym: np.ndarray):
-        lon, lat = self.transformer_to_lonlat().transform(xm, ym)
+        with PROJ_LOCK:
+            lon, lat = self.transformer_to_lonlat().transform(xm, ym)
         return lon, lat
+
+    def transformer_from_lonlat(self) -> Transformer:
+        """A pyproj transformer from (lon, lat) to local metres (x,y)."""
+        aeqd = (
+            f"+proj=aeqd +lat_0={self.lat0} +lon_0={self.lon0} "
+            "+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+        )
+        return Transformer.from_crs("EPSG:4326", aeqd, always_xy=True)
+
+    def lonlat_to_xy(self, lon: np.ndarray, lat: np.ndarray):
+        """Inverse of :meth:`xy_to_lonlat` — (lon,lat) back to local metres."""
+        with PROJ_LOCK:
+            x, y = self.transformer_from_lonlat().transform(lon, lat)
+        return x, y
 
     def composite_reflectivity(self) -> np.ndarray:
         """Column-max reflectivity (ny, nx); NaN where the whole column is empty."""
@@ -156,6 +198,10 @@ class GriddedVolume:
     # --- (de)serialisation for fixtures -----------------------------------
 
     def save_npz(self, path: str | Path) -> None:
+        # Non-reflectivity products are stored as 2D layers under "p_<name>".
+        extra = {
+            f"p_{k}": v for k, v in self.products.items() if k != "reflectivity"
+        }
         np.savez_compressed(
             path,
             site=self.site,
@@ -166,11 +212,13 @@ class GriddedVolume:
             z=self.z,
             lat0=self.lat0,
             lon0=self.lon0,
+            **extra,
         )
 
     @classmethod
     def load_npz(cls, path: str | Path) -> "GriddedVolume":
         d = np.load(path, allow_pickle=False)
+        products = {k[2:]: d[k] for k in d.files if k.startswith("p_")}
         return cls(
             site=str(d["site"]),
             valid_time=str(d["valid_time"]),
@@ -180,4 +228,5 @@ class GriddedVolume:
             z=d["z"],
             lat0=float(d["lat0"]),
             lon0=float(d["lon0"]),
+            products=products,
         )

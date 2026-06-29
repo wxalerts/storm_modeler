@@ -76,13 +76,27 @@ def process_warning(
     tracker = Tracker(params)
     results: list[VolumeResult] = []
 
-    volumes = list(volume_source)  # materialise so we know the total for progress
-    total = len(volumes)
-    for i, volume in enumerate(volumes, 1):
+    # Stream volumes one at a time rather than materialising the whole window:
+    # progress advances as each grids, results (and their renders) arrive
+    # incrementally instead of in one burst, and a cancel takes effect between
+    # volumes. ``total`` is fetched cheaply up front when the source can (e.g.
+    # THREDDS lists its catalog without downloading), else it is left open.
+    total = 0
+    try:
+        total = int(volume_source.estimated_count())
+    except Exception:  # noqa: BLE001 - estimate is best-effort
+        total = 0
+
+    for i, volume in enumerate(volume_source, 1):
         if cancel is not None and cancel.is_set():
             log.info("pipeline.cancelled", warning=warning.id, after=i - 1)
             break
+        total = max(total, i)
+        log.info("pipeline.detect_begin", warning=warning.id, index=i, total=total,
+                 valid_time=volume.valid_time.isoformat(), shape=volume.shape)
         cells = scit_run(volume, params)
+        log.info("pipeline.detect_done", warning=warning.id, index=i,
+                 cells=len(cells))
         tracker.update(cells, volume.valid_time)
         res = VolumeResult(
             warning=warning, site=site, volume=volume, cells=cells,

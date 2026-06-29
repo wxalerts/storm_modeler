@@ -68,7 +68,12 @@ def radar_polydata(volume: GriddedVolume, z: float = 0.0):
 
     comp = volume.composite_reflectivity()  # (ny, nx)
     ny, nx = comp.shape
-    xx, yy = np.meshgrid(volume.x, volume.y)  # metres
+    xx, yy = np.meshgrid(volume.x, volume.y)  # metres east/north of the radar
+    # Radar coverage is a disc centred on the site, not the square analysis grid.
+    # Blank everything beyond the largest circle the grid fully contains so the
+    # display reads as a NEXRAD range ring rather than a filled box.
+    rmax = min(volume.x.max(), -volume.x.min(), volume.y.max(), -volume.y.min())
+    comp = np.where(np.hypot(xx, yy) <= rmax, comp, np.nan)
     lon, lat = volume.xy_to_lonlat(xx.ravel(), yy.ravel())
     lon = np.asarray(lon).reshape(ny, nx)
     lat = np.asarray(lat).reshape(ny, nx)
@@ -79,6 +84,86 @@ def radar_polydata(volume: GriddedVolume, z: float = 0.0):
     grid.point_data["rgba"] = rgba
     grid.point_data["dbz"] = np.nan_to_num(comp.ravel(), nan=-30.0)
     return grid
+
+
+# --- product registry -------------------------------------------------------
+
+#: Per-product display metadata: matplotlib colormap + value range. Reflectivity
+#: uses the hand NWS table instead (``dbz_to_rgba``). Order = the cycle order.
+PRODUCTS: list[dict] = [
+    {"key": "reflectivity", "label": "Reflectivity", "units": "dBZ"},
+    {"key": "velocity", "label": "Velocity", "units": "m/s",
+     "cmap": "RdYlGn_r", "vmin": -32.0, "vmax": 32.0},
+    {"key": "spectrum_width", "label": "Spectrum Width", "units": "m/s",
+     "cmap": "plasma", "vmin": 0.0, "vmax": 14.0},
+    {"key": "differential_reflectivity", "label": "ZDR", "units": "dB",
+     "cmap": "Spectral_r", "vmin": -2.0, "vmax": 6.0},
+    {"key": "cross_correlation_ratio", "label": "Corr. Coeff (CC)", "units": "",
+     "cmap": "turbo", "vmin": 0.2, "vmax": 1.02},
+    {"key": "differential_phase", "label": "Diff. Phase", "units": "deg",
+     "cmap": "viridis", "vmin": 0.0, "vmax": 360.0},
+]
+_PRODUCT_BY_KEY = {p["key"]: p for p in PRODUCTS}
+
+
+def _colorize(field2d: np.ndarray, product: str) -> np.ndarray:
+    """Map a 2D field to RGBA per the product's colormap (transparent where NaN)."""
+    if product == "reflectivity":
+        return dbz_to_rgba(field2d)
+    import matplotlib
+
+    meta = _PRODUCT_BY_KEY[product]
+    cmap = matplotlib.colormaps[meta["cmap"]]
+    norm = (field2d - meta["vmin"]) / (meta["vmax"] - meta["vmin"])
+    rgba = (cmap(np.clip(norm, 0.0, 1.0)) * 255).astype(np.uint8)
+    rgba[..., 3] = np.where(np.isfinite(field2d), 255, 0)
+    rgba[~np.isfinite(field2d), :3] = 0
+    return rgba
+
+
+def product_lonlat_image(
+    volume: GriddedVolume, product: str = "reflectivity",
+    width: int = 768, height: int = 768,
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    """Warp a product's 2D layer onto a regular lon/lat raster, coloured.
+
+    Returns ``(rgba, (lat_min, lon_min, lat_max, lon_max))`` — an ``(h, w, 4)``
+    uint8 image, row 0 = north. The layer is placed on the map by these lat/lon
+    bounds and the cells/warning come from the same lon/lat, so they align. The
+    aeqd grid is resampled by inverse-projecting each target lon/lat pixel back
+    to local metres and bilinearly sampling there.
+    """
+    from scipy.interpolate import RegularGridInterpolator
+
+    field2d = volume.product_2d(product)
+    if field2d is None:
+        field2d = volume.composite_reflectivity()
+        product = "reflectivity"
+
+    # Blank everything outside the radar's range disc (matches the NEXRAD look).
+    xx, yy = np.meshgrid(volume.x, volume.y)
+    rmax = min(volume.x.max(), -volume.x.min(), volume.y.max(), -volume.y.min())
+    field2d = np.where(np.hypot(xx, yy) <= rmax, field2d, np.nan)
+
+    lon_min, lon_max, lat_min, lat_max = geo_bounds(volume)
+    lons = np.linspace(lon_min, lon_max, width)
+    lats = np.linspace(lat_max, lat_min, height)  # row 0 = north
+    LON, LAT = np.meshgrid(lons, lats)
+    x_q, y_q = volume.lonlat_to_xy(LON.ravel(), LAT.ravel())
+
+    interp = RegularGridInterpolator(
+        (volume.y, volume.x), field2d, bounds_error=False, fill_value=np.nan
+    )
+    sampled = interp(np.column_stack([np.asarray(y_q), np.asarray(x_q)]))
+    rgba = _colorize(sampled.reshape(height, width), product)
+    return rgba, (float(lat_min), float(lon_min), float(lat_max), float(lon_max))
+
+
+def composite_lonlat_image(
+    volume: GriddedVolume, width: int = 768, height: int = 768
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    """Back-compat: the reflectivity composite as a lon/lat raster."""
+    return product_lonlat_image(volume, "reflectivity", width, height)
 
 
 def geo_bounds(volume: GriddedVolume) -> tuple[float, float, float, float]:
