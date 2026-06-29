@@ -21,7 +21,7 @@ import structlog
 
 from .config import CACHE_DIR
 from .data.volumes import FixtureVolumeSource
-from .models import GriddedVolume, Warning
+from .models import GriddedVolume, SatelliteScene, Warning
 
 log = structlog.get_logger(__name__)
 
@@ -63,6 +63,17 @@ class DownloadStore:
         name = f"vol_{volume.valid_time:%Y%m%dT%H%M%SZ}.npz"
         volume.save_npz(vdir / name)
 
+    def save_scene(self, warning_id: str, scene: SatelliteScene) -> None:
+        """Persist one ABI cloud-top scene as ``scenes/scene_<valid_time>.npz``.
+
+        Parallel to :meth:`save_volume`; a :class:`~storm_modeler.data.satellite
+        .FixtureSceneSource` over the ``scenes/`` dir replays them offline.
+        """
+        sdir = self.dir(warning_id) / "scenes"
+        sdir.mkdir(parents=True, exist_ok=True)
+        name = f"scene_{scene.valid_time:%Y%m%dT%H%M%SZ}.npz"
+        scene.save_npz(sdir / name)
+
     # --- reads ------------------------------------------------------------
 
     def volume_source(self, warning_id: str) -> FixtureVolumeSource:
@@ -71,6 +82,15 @@ class DownloadStore:
 
     def volume_count(self, warning_id: str) -> int:
         return len(list((self.dir(warning_id) / "volumes").glob("*.npz")))
+
+    def scene_source(self, warning_id: str):
+        """A :class:`FixtureSceneSource` replaying this warning's cached scenes."""
+        from .data.satellite import FixtureSceneSource
+
+        return FixtureSceneSource(self.dir(warning_id))
+
+    def scene_count(self, warning_id: str) -> int:
+        return len(list((self.dir(warning_id) / "scenes").glob("*.npz")))
 
     def warnings(self) -> list[Warning]:
         """Every persisted warning, oldest→newest (skips unreadable dirs)."""

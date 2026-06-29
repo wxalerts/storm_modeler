@@ -14,9 +14,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QDateTime, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDateTimeEdit,
     QDialog,
     QFormLayout,
     QHBoxLayout,
@@ -48,6 +49,26 @@ class SearchParams:
 
 def _z(dt: datetime) -> str:
     return dt.strftime("%H%M") + "Z"
+
+
+def _to_qdt(dt: datetime) -> QDateTime:
+    """Aware UTC :class:`datetime` → UTC-spec :class:`QDateTime`."""
+    return QDateTime.fromSecsSinceEpoch(int(dt.timestamp()), Qt.TimeSpec.UTC)
+
+
+def _from_qdt(qdt: QDateTime) -> datetime:
+    """:class:`QDateTime` → aware UTC :class:`datetime` (spec-independent)."""
+    return datetime.fromtimestamp(qdt.toSecsSinceEpoch(), tz=timezone.utc)
+
+
+def _make_dt_edit(value: datetime) -> QDateTimeEdit:
+    """A UTC datetime field with a calendar dropdown, seeded to *value*."""
+    edit = QDateTimeEdit()
+    edit.setTimeSpec(Qt.TimeSpec.UTC)
+    edit.setDisplayFormat("yyyy-MM-dd HH:mm 'UTC'")
+    edit.setCalendarPopup(True)
+    edit.setDateTime(_to_qdt(value))
+    return edit
 
 
 class _ResultRow(QWidget):
@@ -89,8 +110,8 @@ class SearchDialog(QDialog):
         form = QFormLayout()
         now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         lookback = settings.iem_default_lookback_hours if settings else 12
-        self.start_edit = QLineEdit((now - timedelta(hours=lookback)).strftime("%Y-%m-%dT%H:%MZ"))
-        self.end_edit = QLineEdit(now.strftime("%Y-%m-%dT%H:%MZ"))
+        self.start_edit = _make_dt_edit(now - timedelta(hours=lookback))
+        self.end_edit = _make_dt_edit(now)
         self.states_edit = QLineEdit(",".join(settings.iem_default_states) if settings else "")
         self.states_edit.setPlaceholderText("states/WFO, e.g. TX,OK")
         self.tornado_chk = QCheckBox("Tornado")
@@ -141,24 +162,16 @@ class SearchDialog(QDialog):
 
     # --- search -----------------------------------------------------------
 
-    def _parse(self, s: str) -> datetime:
-        return datetime.fromisoformat(s.strip().replace("Z", "+00:00")).astimezone(
-            timezone.utc
-        )
-
     def _emit_search(self) -> None:
-        try:
-            params = SearchParams(
-                start=self._parse(self.start_edit.text()),
-                end=self._parse(self.end_edit.text()),
-                states=[s.strip().upper() for s in self.states_edit.text().split(",") if s.strip()],
-                tornado=self.tornado_chk.isChecked(),
-                severe=self.severe_chk.isChecked(),
-                pre_minutes=self.pre_spin.value(),
-                post_minutes=self.post_spin.value(),
-            )
-        except ValueError:
-            return
+        params = SearchParams(
+            start=_from_qdt(self.start_edit.dateTime()),
+            end=_from_qdt(self.end_edit.dateTime()),
+            states=[s.strip().upper() for s in self.states_edit.text().split(",") if s.strip()],
+            tornado=self.tornado_chk.isChecked(),
+            severe=self.severe_chk.isChecked(),
+            pre_minutes=self.pre_spin.value(),
+            post_minutes=self.post_spin.value(),
+        )
         self.search_requested.emit(params)
 
     def set_searching(self, on: bool) -> None:

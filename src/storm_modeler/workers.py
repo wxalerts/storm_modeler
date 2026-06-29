@@ -45,6 +45,135 @@ class SearchSignals(QObject):
     finished = Signal()
 
 
+class LightningSignals(QObject):
+    flashes = Signal(object)  # list[Flash] for the warning's window
+    status = Signal(str)
+    error = Signal(str)
+    finished = Signal()
+
+
+class LightningWorker(QRunnable):
+    """Fetch GOES GLM flashes for one warning's window off the GUI thread.
+
+    Lists + downloads + parses the GLM ``LCFA`` files (see
+    :class:`storm_modeler.data.lightning.GLMSource`) and emits the flash list
+    once, for the map to layer as markers. Cancellation is a checked
+    ``threading.Event`` (the global Stop reaches it via ``request_cancel``).
+    """
+
+    def __init__(
+        self,
+        start,
+        end,
+        bbox,
+        bucket: str | None = None,
+        max_flashes: int = 5000,
+        good_only: bool = True,
+        cancel: threading.Event | None = None,
+    ) -> None:
+        super().__init__()
+        self.start = start
+        self.end = end
+        self.bbox = bbox
+        self.bucket = bucket
+        self.max_flashes = max_flashes
+        self.good_only = good_only
+        self.cancel = cancel or threading.Event()
+        self.signals = LightningSignals()
+
+    def request_cancel(self) -> None:
+        self.cancel.set()
+
+    @Slot()
+    def run(self) -> None:  # noqa: D401 - QRunnable entry point
+        from .data.lightning import GLMSource
+
+        try:
+            src = GLMSource(
+                self.start, self.end, self.bbox, bucket=self.bucket,
+                max_flashes=self.max_flashes, good_only=self.good_only,
+            )
+            src.set_status_callback(self.signals.status.emit)
+            flashes = src.flashes(cancel=self.cancel)
+            self.signals.flashes.emit(flashes)
+        except Exception as e:  # noqa: BLE001
+            log.error("lightning.run_error", error=str(e))
+            self.signals.error.emit(f"{type(e).__name__}: {e}")
+        finally:
+            self.signals.finished.emit()
+
+
+class SatelliteSignals(QObject):
+    # (warning, SatelliteScene, list[CloudTopCell], index, total) — the worker
+    # downloads, reprojects (pure NumPy, no pyproj), detects, and tracks; the
+    # GUI thread does radar association (it needs the in-memory radar results),
+    # the map overlay, and persistence.
+    scene_ready = Signal(object, object, object, int, int)
+    progress = Signal(int, int, str)  # index, total, label (e.g. "GOES-19 1742Z")
+    status = Signal(str)  # human-readable sub-step line (list/download/reproject)
+    warning_started = Signal(object)  # Warning
+    warning_done = Signal(object)  # Warning
+    error = Signal(str)
+    finished = Signal()
+
+
+class SatelliteWorker(QRunnable):
+    """Ingest + detect GOES ABI cloud-top cells for one warning, off the GUI thread.
+
+    Streams reprojected scenes from :class:`storm_modeler.data.satellite.ABISource`
+    (download + geostationary→lon/lat reprojection are pyproj-free, so they are
+    worker-safe), runs cloud-top detection and tracking per scene, and emits each
+    scene + its tracked cells for the GUI to associate with radar, render, and
+    persist. Cancellation is a checked ``threading.Event``.
+    """
+
+    def __init__(
+        self,
+        warning: Warning,
+        scene_source,
+        params,
+        cancel: threading.Event | None = None,
+    ) -> None:
+        super().__init__()
+        self.warning = warning
+        self.scene_source = scene_source
+        self.params = params
+        self.cancel = cancel or threading.Event()
+        self.signals = SatelliteSignals()
+
+    def request_cancel(self) -> None:
+        self.cancel.set()
+
+    @Slot()
+    def run(self) -> None:  # noqa: D401 - QRunnable entry point
+        from .detection.cloudtop import Tracker as CloudTopTracker, run as cloudtop_run
+
+        self.signals.warning_started.emit(self.warning)
+        try:
+            self.scene_source.set_status_callback(self.signals.status.emit)
+            try:
+                total = int(self.scene_source.estimated_count())
+            except Exception:  # noqa: BLE001
+                total = 0
+            tracker = CloudTopTracker(self.params)
+            for i, scene in enumerate(self.scene_source.scenes(self.cancel), 1):
+                if self.cancel.is_set():
+                    break
+                total = max(total, i)
+                cells = cloudtop_run(scene, self.params)
+                tracker.update(cells, scene.valid_time)
+                self.signals.progress.emit(
+                    i, total, f"{scene.satellite} {scene.valid_time:%H%MZ}"
+                )
+                self.signals.scene_ready.emit(self.warning, scene, cells, i, total)
+        except Exception as e:  # noqa: BLE001
+            log.error("satellite.run_error", error=str(e))
+            self.signals.error.emit(f"{type(e).__name__}: {e}")
+        finally:
+            self.signals.warning_done.emit(self.warning)
+            self.signals.finished.emit()
+
+
 class SearchWorker(QRunnable):
     """Run an IEM historical query off the GUI thread, emitting each warning."""
 

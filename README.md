@@ -14,13 +14,15 @@ row carries a `settings_hash` tracing it to the exact knob set that produced it.
 
 ## Features
 
-- **4-window, GIMP-style layout** (each a separate top-level window):
+- **5-window, GIMP-style layout** (each a separate top-level window):
   - **Data** — IEM search, the Downloaded list, and the per-volume storm list (the hub; closing it quits).
-  - **Map** — a real **Leaflet** map with **ESRI** imagery tiles. It runs as its own **WebKitGTK** process (Qt WebEngine renders black on some Linux GL stacks), driven over a pipe. Radar overlay + warning polygon + SCIT cell envelopes are all placed by lat/lon, so they line up exactly. Pan/drag + scroll-zoom, no 3D rotation.
+  - **Map** — a real **Leaflet** map with **ESRI** imagery tiles. It runs as its own **WebKitGTK** process (Qt WebEngine renders black on some Linux GL stacks), driven over a pipe. Radar overlay + warning polygon + SCIT cell envelopes + GLM lightning markers are all placed by lat/lon, so they line up exactly. Pan/drag + scroll-zoom, no 3D rotation.
   - **3D View** — VTK perspective volume render, isosurfaces, envelope prism, echo-top marker, and a vertical cross-section, framed on the selected cell.
+  - **Lightning** — fetches **GOES GLM** flashes for the selected warning's window and layers them on the Map as markers (see below).
   - **Logs** — a live tail of the run's log.
 - **Full dual-pol product cycling** — Reflectivity, Velocity, Spectrum Width, ZDR, Correlation Coefficient, Differential Phase, each with its own color scale. Cycle with the **Product** menu or the **P** key; the moment is labeled on the map. (Reflectivity is the column-max composite; the other moments are the lowest-tilt layer.)
 - **Synced Map + 3D playback loop** — the scrubber steps through a warning's volumes and loops; the map overlay and the 3D view advance in lock-step.
+- **GOES GLM lightning overlay** — the Lightning window pulls L2 `LCFA` flashes for the selected warning's data window from the `noaa-goes16`/`noaa-goes19` (GOES-East) S3 buckets (anonymous boto3, threaded downloads — the same fast path as the radar pull), keeps the flashes inside the warning's padded bounding box, and layers them on the Leaflet map as canvas markers ramped oldest→newest. Bounding-box padding, the marker cap, and the quality filter are runtime-tunable.
 - **Fast, multi-threaded downloads** — anonymous reads from the Unidata `unidata-nexrad-level2` S3 mirror (boto3, unsigned), fetched concurrently with a bounded look-ahead while gridding/yielding stays in order (SCIT tracking is order-sensitive). ~30× faster than the THREDDS HTTP path on a typical link.
 - **Runtime-tunable detection** — every threshold/window/display pref is a `SettingSpec` resolved from registry-defaults ⊕ PostGIS overrides into a typed `DetectionParams`; no tunable is a module constant.
 - **Diagnostics to stdout** — structlog tees to stdout + a per-run log file, with `faulthandler` and excepthooks installed so a native crash (VTK/PROJ) or an escaped exception is captured rather than vanishing.

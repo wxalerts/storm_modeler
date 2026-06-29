@@ -17,6 +17,8 @@ GROUP_DATA_WINDOW = "Data window"
 GROUP_IEM = "IEM"
 GROUP_DISPLAY = "Display"
 GROUP_VIEWER = "Viewer (3D)"
+GROUP_LIGHTNING = "Lightning"
+GROUP_SATELLITE = "Satellite (GOES ABI)"
 
 
 @dataclass(frozen=True)
@@ -87,7 +89,12 @@ REGISTRY: tuple[SettingSpec, ...] = (
     SettingSpec("grid_v_km", "Grid vertical spacing (km)", GROUP_DETECTION, "float",
                 0.5, "Cartesian analysis grid vertical spacing.", min=0.1, max=2.0),
     SettingSpec("watershed_split", "Watershed cell splitting", GROUP_DETECTION, "bool",
-                False, "Split merged reflectivity blobs via watershed."),
+                True, "Split merged multi-core systems into separate cells at "
+                "reflectivity saddles (seed split + footprint partition)."),
+    SettingSpec("watershed_min_sep_km", "Watershed peak separation (km)",
+                GROUP_DETECTION, "float", 14.0, "Minimum distance between split "
+                "cores when watershed splitting; larger merges nearby cores "
+                "(fewer cells).", min=1.0, max=50.0),
     SettingSpec("track_max_km", "Track max displacement (km)", GROUP_DETECTION, "float",
                 12.0, "Max centroid displacement between volumes to associate a "
                 "track.", min=0.0, max=100.0),
@@ -133,6 +140,54 @@ REGISTRY: tuple[SettingSpec, ...] = (
     SettingSpec("grid_cache_size", "Grid cache size", GROUP_VIEWER, "int",
                 8, "Number of re-gridded volumes the viewer keeps in memory "
                 "(LRU) for responsive scrubbing.", min=1, max=64),
+    # -- Lightning (GOES GLM) ---------------------------------------------
+    SettingSpec("lightning_max_flashes", "Max flash markers", GROUP_LIGHTNING, "int",
+                5000, "Cap on flash markers placed on the map; above this the "
+                "flashes are evenly subsampled.", min=100, max=200000),
+    SettingSpec("lightning_bbox_pad_deg", "Bounding-box padding (deg)",
+                GROUP_LIGHTNING, "float", 0.5, "Degrees of lat/lon padding around "
+                "the warning polygon when keeping flashes.", min=0.0, max=5.0),
+    SettingSpec("lightning_quality_good_only", "Good-quality flashes only",
+                GROUP_LIGHTNING, "bool", True, "Keep only GLM flashes whose "
+                "quality flag is good (flag == 0)."),
+    # -- Satellite (GOES ABI Band-13 cloud-top) ---------------------------
+    SettingSpec("sat_auto_fetch", "Auto-fetch after download", GROUP_SATELLITE,
+                "bool", False, "Automatically run the GOES cloud-top pull for a "
+                "warning once its radar download finishes (annotates each volume's "
+                "storms with cloud-top temp + OT). Off by default."),
+    SettingSpec("sat_cold_bt_k", "Cold-cloud threshold (K)", GROUP_SATELLITE,
+                "float", 235.0, "Brightness temperature at/below which a pixel "
+                "is cold cloud and seeds a cloud-top object.", min=180.0, max=300.0),
+    SettingSpec("sat_min_area_km2", "Min cold-object area (km^2)", GROUP_SATELLITE,
+                "float", 25.0, "Minimum cold-object footprint to admit (rejects "
+                "speckle).", min=0.0, max=10000.0),
+    SettingSpec("sat_anvil_bt_k", "Anvil threshold (K)", GROUP_SATELLITE, "float",
+                220.0, "Brightness temperature defining the cold anvil canopy.",
+                min=180.0, max=280.0),
+    SettingSpec("sat_anvil_area_km2", "Anviled-out area (km^2)", GROUP_SATELLITE,
+                "float", 2500.0, "Cold-canopy area at/above which a cell is "
+                "flagged 'anviled out'.", min=0.0, max=100000.0),
+    SettingSpec("sat_ot_delta_k", "OT minus anvil depth (K)", GROUP_SATELLITE,
+                "float", 6.5, "Coldest pixel must be this much colder than the "
+                "surrounding anvil to flag an overshooting top.", min=0.0, max=40.0),
+    SettingSpec("sat_ot_max_bt_k", "OT max BT (K)", GROUP_SATELLITE, "float",
+                205.0, "Coldest pixel must be at/below this to flag an "
+                "overshooting top.", min=170.0, max=260.0),
+    SettingSpec("sat_track_max_km", "Cloud-top track max (km)", GROUP_SATELLITE,
+                "float", 20.0, "Max displacement between scenes to continue a "
+                "cloud-top track.", min=0.0, max=200.0),
+    SettingSpec("sat_track_miss_max", "Cloud-top track miss tolerance",
+                GROUP_SATELLITE, "int", 2, "Scenes a cloud-top track may be "
+                "unmatched before it ends.", min=0, max=10),
+    SettingSpec("sat_assoc_max_km", "Radar-association max (km)", GROUP_SATELLITE,
+                "float", 15.0, "Max cold-core to radar-core distance to associate "
+                "for tilt.", min=0.0, max=100.0),
+    SettingSpec("sat_bbox_pad_deg", "Bounding-box padding (deg)", GROUP_SATELLITE,
+                "float", 0.5, "Degrees of lat/lon padding around the warning "
+                "polygon for the ABI crop.", min=0.0, max=5.0),
+    SettingSpec("sat_target_res_deg", "Reproject resolution (deg)", GROUP_SATELLITE,
+                "float", 0.02, "Regular lon/lat raster spacing for the "
+                "reprojected brightness temperature.", min=0.005, max=0.1),
 )
 
 REGISTRY_BY_KEY: dict[str, SettingSpec] = {s.key: s for s in REGISTRY}
@@ -141,7 +196,17 @@ REGISTRY_BY_KEY: dict[str, SettingSpec] = {s.key: s for s in REGISTRY}
 DETECTION_KEYS: tuple[str, ...] = (
     "seed_dbz", "base_dbz", "seed_min_separation_km", "echo_top_min_km",
     "continuity_dbz", "continuity_levels", "min_area_km2", "grid_h_km",
-    "grid_v_km", "watershed_split", "track_max_km", "track_miss_max",
+    "grid_v_km", "watershed_split", "watershed_min_sep_km", "track_max_km",
+    "track_miss_max",
+)
+
+# Cloud-top detection knob set (provenance). Crop/reproject keys
+# (sat_bbox_pad_deg, sat_target_res_deg) are display/ingest choices, not
+# detection knobs, so they are excluded from the hash.
+CLOUDTOP_KEYS: tuple[str, ...] = (
+    "sat_cold_bt_k", "sat_min_area_km2", "sat_anvil_bt_k", "sat_anvil_area_km2",
+    "sat_ot_delta_k", "sat_ot_max_bt_k", "sat_track_max_km", "sat_track_miss_max",
+    "sat_assoc_max_km",
 )
 
 

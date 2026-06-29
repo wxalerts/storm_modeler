@@ -23,8 +23,19 @@ from .data.sites import Site, SiteResolver
 from .data.volumes import FixtureVolumeSource, VolumeSource
 from .data.warnings import FixtureWarningSource
 from .detection.detection_v2 import StormCell, Tracker, run as scit_run
-from .models import GriddedVolume, Warning
-from .settings.resolver import DetectionParams, ResolvedSettings, resolve
+from .detection.cloudtop import (
+    CloudTopCell,
+    Tracker as CloudTopTracker,
+    associate_radar,
+    run as cloudtop_run,
+)
+from .models import GriddedVolume, SatelliteScene, Warning
+from .settings.resolver import (
+    CloudTopParams,
+    DetectionParams,
+    ResolvedSettings,
+    resolve,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -110,6 +121,89 @@ def process_warning(
         )
         if on_progress is not None:
             on_progress(i, total, volume)
+        if on_result is not None:
+            on_result(res)
+    return results
+
+
+@dataclass
+class SatelliteResult:
+    """One processed ABI scene: the cloud-top cells found, tagged to its warning."""
+
+    warning: Warning
+    scene: SatelliteScene
+    cloudtops: list[CloudTopCell]
+    index: int = 0
+    total: int = 0
+    settings_hash: str = ""
+
+
+SatelliteResultHandler = Callable[[SatelliteResult], None]
+SatelliteProgressHandler = Callable[[int, int, SatelliteScene], None]
+
+
+def _nearest_radar_cells(
+    radar_results: list[VolumeResult], when: datetime
+) -> list[StormCell]:
+    """Cells of the radar volume whose valid_time is closest to ``when``."""
+    if not radar_results:
+        return []
+    nearest = min(
+        radar_results,
+        key=lambda r: abs((r.volume.valid_time - when).total_seconds()),
+    )
+    return nearest.cells
+
+
+def process_warning_satellite(
+    warning: Warning,
+    scene_source,
+    params: CloudTopParams | None = None,
+    radar_results: list[VolumeResult] | None = None,
+    on_result: SatelliteResultHandler | None = None,
+    on_progress: SatelliteProgressHandler | None = None,
+    cancel: threading.Event | None = None,
+) -> list[SatelliteResult]:
+    """Run every ABI scene for one warning through cloud-top detection.
+
+    Streams scenes oldest→newest: each is identified, tracked across scenes, and
+    — when ``radar_results`` is given — associated to the nearest-in-time radar
+    volume to measure storm tilt. Mirrors :func:`process_warning`; honours
+    ``cancel`` between scenes, keeping everything already handed to ``on_result``.
+    """
+    params = params or CloudTopParams()
+    tracker = CloudTopTracker(params)
+    results: list[SatelliteResult] = []
+
+    total = 0
+    try:
+        total = int(scene_source.estimated_count())
+    except Exception:  # noqa: BLE001 - estimate is best-effort
+        total = 0
+
+    for i, scene in enumerate(scene_source, 1):
+        if cancel is not None and cancel.is_set():
+            log.info("pipeline.sat_cancelled", warning=warning.id, after=i - 1)
+            break
+        total = max(total, i)
+        cells = cloudtop_run(scene, params)
+        tracker.update(cells, scene.valid_time)
+        if radar_results:
+            associate_radar(
+                cells, _nearest_radar_cells(radar_results, scene.valid_time), params
+            )
+        res = SatelliteResult(
+            warning=warning, scene=scene, cloudtops=cells,
+            index=i, total=total, settings_hash=params.settings_hash,
+        )
+        results.append(res)
+        log.info(
+            "pipeline.scene", warning=warning.id,
+            valid_time=scene.valid_time.isoformat(),
+            cloudtops=len(cells), index=i, total=total,
+        )
+        if on_progress is not None:
+            on_progress(i, total, scene)
         if on_result is not None:
             on_result(res)
     return results
