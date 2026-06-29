@@ -18,6 +18,7 @@ import faulthandler
 import logging
 import os
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,13 +46,17 @@ def current_log_path() -> Path | None:
 
 
 class _Tee:
-    """Write structlog output to stderr and the log file at once."""
+    """Write structlog output to stdout and the log file at once.
+
+    stdout (not stderr) so every log line — including errors — pipes out where
+    the dev is watching and to anything consuming the process's stdout.
+    """
 
     def __init__(self, fh) -> None:
         self._fh = fh
 
     def write(self, s: str) -> int:
-        sys.stderr.write(s)
+        sys.stdout.write(s)
         try:
             self._fh.write(s)
         except Exception:  # noqa: BLE001
@@ -60,7 +65,7 @@ class _Tee:
 
     def flush(self) -> None:
         try:
-            sys.stderr.flush()
+            sys.stdout.flush()
             self._fh.flush()
         except Exception:  # noqa: BLE001
             pass
@@ -83,12 +88,17 @@ def setup_logging(level: str | None = None) -> Path:
     _LOG_FH = fh
     _LOG_PATH = path
 
-    # Native-crash diagnostics: dump every thread's Python stack into the log on
-    # SIGSEGV/SIGABRT/SIGBUS/SIGFPE. faulthandler needs a real file descriptor.
-    try:
-        faulthandler.enable(file=fh, all_threads=True)
-    except Exception:  # noqa: BLE001
-        pass
+    # Native-crash diagnostics: dump every thread's Python stack on
+    # SIGSEGV/SIGABRT/SIGBUS/SIGFPE — once into the log file (survives the
+    # terminal closing) and once to stdout (where the dev is watching, so a
+    # segfault is no longer silently swallowed). faulthandler needs a real file
+    # descriptor; the last enable() wins, so register the file first and stdout
+    # last to keep both targets active.
+    for target in (fh, sys.stdout):
+        try:
+            faulthandler.enable(file=target, all_threads=True)
+        except Exception:  # noqa: BLE001
+            pass
 
     structlog.configure(
         processors=[
@@ -102,6 +112,22 @@ def setup_logging(level: str | None = None) -> Path:
         logger_factory=structlog.WriteLoggerFactory(file=_Tee(fh)),
         cache_logger_on_first_use=False,
     )
+
+    # Route uncaught *Python* exceptions through the logger (→ stdout + file)
+    # instead of the interpreter's default stderr dump, which Qt can also
+    # swallow when an exception escapes a slot. Covers the main thread and
+    # QThreadPool/threading workers.
+    def _log_uncaught(exc_type, exc, tb) -> None:
+        log.error("uncaught", exc_info=(exc_type, exc, tb))
+
+    def _log_uncaught_thread(args) -> None:
+        log.error(
+            "uncaught.thread", thread=getattr(args.thread, "name", "?"),
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = _log_uncaught
+    threading.excepthook = _log_uncaught_thread
 
     log.info(
         "logging.start", path=str(path), pid=os.getpid(), level=level,

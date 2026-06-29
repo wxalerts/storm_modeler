@@ -165,8 +165,13 @@ class IEMHistoricalSource(WarningSource):
     def _fetch_raw(self) -> list[dict]:
         """Fetch the SBW shapefile from IEM and return raw feature dicts.
 
-        Lazily imports httpx + geopandas (the ``live`` extra). Cached to disk so
-        a second run is offline.
+        Reads the shapefile with pyogrio's *raw* reader + shapely — deliberately
+        NOT geopandas. ``geopandas.read_file`` builds a pyproj CRS object, and
+        PROJ's context init is not safe on the ``QThreadPool`` search worker (it
+        segfaults — see workers.py). The raw reader returns WKB geometry + plain
+        attribute arrays with no pyproj touch; the IEM service already serves
+        EPSG:4326, so no reprojection is needed. ``httpx``/``pyogrio``/``shapely``
+        are the ``live`` extra. Cached to disk so a second run is offline.
         """
         cache = self._cache_path()
         if cache.exists():
@@ -176,7 +181,6 @@ class IEMHistoricalSource(WarningSource):
         import io
         import zipfile
 
-        import geopandas as gpd  # type: ignore
         import httpx  # type: ignore
 
         log.info("iem.fetch", sts=_iso_z(self.start), ets=_iso_z(self.end))
@@ -187,25 +191,47 @@ class IEMHistoricalSource(WarningSource):
             tmp = self.cache_dir / "_tmp"
             tmp.mkdir(parents=True, exist_ok=True)
             zf.extractall(tmp)
-            shp = next(tmp.glob("*.shp"))
-            gdf = gpd.read_file(shp).to_crs("EPSG:4326")
-
-        records = []
-        for _, row in gdf.iterrows():
-            records.append(self._row_to_record(row))
+            # Pick the .shp from *this* zip's contents — _tmp accumulates
+            # shapefiles across fetches, so globbing the dir can return a stale
+            # (even empty) one.
+            shp_name = next(n for n in zf.namelist() if n.endswith(".shp"))
+            records = [
+                self._row_to_record(attrs, geom)
+                for attrs, geom in self._read_features(tmp / shp_name)
+            ]
 
         cache.parent.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps(records))
         return records
 
     @staticmethod
-    def _row_to_record(row) -> dict:
+    def _read_features(shp_path) -> list[tuple[dict, object]]:
+        """(`attrs`, `shapely geometry`) per feature, via pyogrio's raw reader.
+
+        Avoids geopandas/pyproj entirely (no CRS object is constructed), which is
+        what keeps the search worker thread from segfaulting in PROJ.
+        """
+        import shapely  # type: ignore
+        from pyogrio.raw import read as raw_read  # type: ignore
+
+        meta, _fids, geometry, field_data = raw_read(shp_path)
+        fields = list(meta["fields"])
+        out: list[tuple[dict, object]] = []
+        for i in range(len(geometry)):
+            attrs = {f: field_data[j][i] for j, f in enumerate(fields)}
+            wkb = geometry[i]
+            geom = shapely.from_wkb(wkb) if wkb is not None else None
+            out.append((attrs, geom))
+        return out
+
+    @staticmethod
+    def _row_to_record(attrs: dict, geom) -> dict:
         def g(*names, default=None):
             for n in names:
-                if n in row:
-                    v = row[n]
-                    # Skip missing values, incl. GeoPandas' float NaN for empty
-                    # DBF cells (e.g. NWS_UGC on a polygon-only warning).
+                if n in attrs:
+                    v = attrs[n]
+                    # Skip missing values, incl. float NaN for empty DBF cells
+                    # (e.g. NWS_UGC on a polygon-only warning).
                     if v is not None and not (isinstance(v, float) and v != v):
                         return v
             return default
@@ -213,17 +239,17 @@ class IEMHistoricalSource(WarningSource):
         ugc = g("UGC", "NWS_UGC", "ugc", default="")
         ugc_list = [u for u in str(ugc).split(",") if u] if ugc else []
         return {
-            "phenomena": g("PHENOM", "phenomena", default=""),
-            "significance": g("SIG", "significance", default=""),
-            "wfo": g("WFO", "wfo", default=""),
+            "phenomena": str(g("PHENOM", "phenomena", default="")),
+            "significance": str(g("SIG", "significance", default="")),
+            "wfo": str(g("WFO", "wfo", default="")),
             "etn": int(g("ETN", "eventid", default=0) or 0),
             # Prefer the stable *initial* VTEC issue/expire so the event's times
             # are the same on every segment row (dedup becomes order-independent).
             "issued": _normalize_ts(g("INIT_ISS", "ISSUED", "issue", default="")),
             "expires": _normalize_ts(g("INIT_EXP", "EXPIRED", "expire", default="")),
             "ugc": ugc_list,
-            "status": g("STATUS", "status", default=""),
-            "geometry": _largest_polygon_mapping(row.geometry),
+            "status": str(g("STATUS", "status", default="")),
+            "geometry": _largest_polygon_mapping(geom),
         }
 
     def warnings(self) -> Iterator[Warning]:

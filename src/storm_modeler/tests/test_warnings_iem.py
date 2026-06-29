@@ -68,7 +68,8 @@ def _row(**over):
 
 
 def test_row_to_record_normalises_and_cleans():
-    rec = IEMHistoricalSource._row_to_record(_row())
+    row = _row()
+    rec = IEMHistoricalSource._row_to_record(row, row["geometry"])
     assert rec["issued"] == "2024-05-25T11:42:00+00:00"
     assert rec["expires"] == "2024-05-25T12:15:00+00:00"
     assert rec["phenomena"] == "TO" and rec["significance"] == "W"
@@ -79,7 +80,8 @@ def test_row_to_record_normalises_and_cleans():
 
 def test_row_to_record_reduces_multipolygon_to_largest():
     mp = MultiPolygon([box(0, 0, 1, 1), box(0, 0, 4, 4)])  # second lobe larger
-    rec = IEMHistoricalSource._row_to_record(_row(geometry=mp))
+    row = _row(geometry=mp)
+    rec = IEMHistoricalSource._row_to_record(row, row["geometry"])
     assert rec["geometry"]["type"] == "Polygon"
     # The 4x4 lobe (area 16) wins over the 1x1 (area 1).
     from shapely.geometry import shape

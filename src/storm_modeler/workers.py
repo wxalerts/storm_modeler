@@ -32,6 +32,7 @@ class WorkerSignals(QObject):
     # building those on a QThreadPool worker segfaults in PROJ — see app._on_gridded).
     volume_gridded = Signal(object, object, int, int)
     progress = Signal(int, int, str)  # index, total, label (e.g. "KFWS 1142Z")
+    status = Signal(str)  # human-readable sub-step line (download/grid progress)
     warning_started = Signal(object)  # Warning
     warning_done = Signal(object)  # Warning
     error = Signal(str)
@@ -107,6 +108,9 @@ class WarningWorker(QRunnable):
                  thread=threading.get_ident())
         try:
             self.signals.warning_started.emit(self.warning)
+            # Surface the source's sub-step lines (listing/download/grid) to the
+            # GUI so the dialog shows motion during each long-running volume.
+            self.volume_source.set_status_callback(self.signals.status.emit)
             total = 0
             try:
                 total = int(self.volume_source.estimated_count())

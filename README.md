@@ -1,134 +1,95 @@
-# WxAlerts Storm Modeler — Phase A
+# WxAlerts Storm Modeler
 
-A 3-pane desktop validation harness around the **SCIT** storm-cell
-identification & tracking package (`detection_v2`, the code under test). IEM
-**historical** warnings drive archived radar-volume downloads, volumes run
-through SCIT, results render on a self-rendered top-down map and a clickable
-nav, and land in PostGIS. **Every SCIT tunable is editable at runtime** from a
-settings dialog backed by PostGIS — no code changes to tune. No 3D yet (Phase
-B); no alert dispatch ever.
+A desktop validation harness around the **SCIT** storm-cell identification &
+tracking package (`detection_v2`, the code under test). IEM historical warnings
+drive archived NEXRAD volume downloads; each volume is gridded with Py-ART, run
+through SCIT, and the results render across a multi-window GUI — a Leaflet radar
+map, an interactive 3D storm view, and a live log — and optionally land in
+PostGIS. **Every SCIT tunable is editable at runtime** from a settings dialog;
+no code changes to tune. No alert dispatch — this is an analysis/validation tool.
 
 Historical + deterministic: each warning is a fixed-window event with fully
-archived radar behind it, so the pipeline is reproducible — re-running a warning
-yields identical cells. Every detection row carries a `settings_hash` so it is
-traceable to the exact knob set that produced it.
+archived radar behind it, so a re-run yields identical cells. Every detection
+row carries a `settings_hash` tracing it to the exact knob set that produced it.
+
+## Features
+
+- **4-window, GIMP-style layout** (each a separate top-level window):
+  - **Data** — IEM search, the Downloaded list, and the per-volume storm list (the hub; closing it quits).
+  - **Map** — a real **Leaflet** map with **ESRI** imagery tiles. It runs as its own **WebKitGTK** process (Qt WebEngine renders black on some Linux GL stacks), driven over a pipe. Radar overlay + warning polygon + SCIT cell envelopes are all placed by lat/lon, so they line up exactly. Pan/drag + scroll-zoom, no 3D rotation.
+  - **3D View** — VTK perspective volume render, isosurfaces, envelope prism, echo-top marker, and a vertical cross-section, framed on the selected cell.
+  - **Logs** — a live tail of the run's log.
+- **Full dual-pol product cycling** — Reflectivity, Velocity, Spectrum Width, ZDR, Correlation Coefficient, Differential Phase, each with its own color scale. Cycle with the **Product** menu or the **P** key; the moment is labeled on the map. (Reflectivity is the column-max composite; the other moments are the lowest-tilt layer.)
+- **Synced Map + 3D playback loop** — the scrubber steps through a warning's volumes and loops; the map overlay and the 3D view advance in lock-step.
+- **Fast, multi-threaded downloads** — anonymous reads from the Unidata `unidata-nexrad-level2` S3 mirror (boto3, unsigned), fetched concurrently with a bounded look-ahead while gridding/yielding stays in order (SCIT tracking is order-sensitive). ~30× faster than the THREDDS HTTP path on a typical link.
+- **Runtime-tunable detection** — every threshold/window/display pref is a `SettingSpec` resolved from registry-defaults ⊕ PostGIS overrides into a typed `DetectionParams`; no tunable is a module constant.
+- **Diagnostics to stdout** — structlog tees to stdout + a per-run log file, with `faulthandler` and excepthooks installed so a native crash (VTK/PROJ) or an escaped exception is captured rather than vanishing.
 
 ## Architecture
 
 ```
 settings/registry.py   SettingSpec list — the single source of every tunable
-settings/store.py      app_settings (PostGIS) — runtime overrides
-settings/resolver.py   defaults ⊕ overrides -> DetectionParams (+ settings_hash)
+settings/resolver.py   defaults ⊕ PostGIS overrides -> DetectionParams (+ hash)
         │
-WarningSource ─ IEMHistoricalSource (IEM SBW archive, TO/SV·W)   data/warnings.py
-              └ FixtureWarningSource (offline replay)
-        │  SiteResolver (full CONUS WSR-88D table)                data/sites.py
-VolumeSource ─ NexradArchiveSource (noaa-nexrad-level2 + Py-ART)  data/volumes.py
-             └ FixtureVolumeSource (pre-gridded .npz)
-        │  grid → detection_v2.run(volume, params) → cells    (off the GUI thread)
+WarningSource ─ IEMHistoricalSource (IEM SBW archive, TO/SV·W; pyogrio raw read)  data/warnings.py
+        │  SiteResolver (full CONUS WSR-88D table)                                data/sites.py
+VolumeSource ─ S3Level2Source (unidata-nexrad-level2, boto3 unsigned, threaded)   data/volumes.py
+             ├ ThreddsLevel2Source (anonymous HTTP fallback)
+             └ FixtureVolumeSource (replay pre-gridded .npz — also the download cache)
+        │  grid_level2 → all dual-pol moments → detection_v2.run(volume, params)
 detection/detection_v2/  identify.py · track.py   ← SCIT, under test, no globals
         │
         ├─▶ persist: warnings_v2 + cells_v2 (+ settings_hash), per-volume commit
-        └─▶ Qt signals → search/volumes panes + self-rendered map
+        └─▶ Qt signals → Data / 3D / Logs windows  +  pipe → GTK Leaflet map
 ```
 
-* **No tunable is a module constant** — detection thresholds, data-window
-  minutes, IEM defaults, and display prefs are all `SettingSpec`s in the
-  registry. The resolver merges DB overrides over registry defaults into a typed
-  `DetectionParams`, which is passed explicitly to `detection_v2.run`.
-* **Workers** run all I/O + gridding + SCIT + persistence on a `QThreadPool`;
-  downloads commit **per volume** and a checked cancel `Event` stops further
-  fetching while keeping everything already committed.
-
-## GUI (A2)
-
-`QMainWindow` → horizontal splitter:
-
-1. **Left panel** — a vertical splitter: IEM **search** form + results (each
-   result has a `[Download]` button) on top; the selected warning's **volumes +
-   detections** below (storm click → map recenter/highlight).
-2. **Map** — VTK orthographic top-down: vector basemap, self-rendered composite
-   reflectivity (NWS dBZ colours, never a tile server), cell envelopes, warning
-   polygon, selected-cell highlight.
-3. **Model** — Phase B placeholder.
-
-**Settings dialog**: a top search box filters the list live; a scrolling table
-with type-aware editors (spin/checkbox/combo/line edit, min/max/choice
-validated); a Save button writes only changed keys to `app_settings`, reloads
-the resolver, and re-applies on the next run.
+Gridding/SCIT run on a `QThreadPool`; SCIT detection itself runs on the GUI
+thread (PROJ is not safe to first-init on a worker). Downloads commit **per
+volume**; a checked cancel `Event` stops further fetching while keeping
+everything already committed. Downloaded warnings persist to a local cache and
+replay offline through the identical pipeline.
 
 ## Setup
 
 ```bash
-uv sync                 # core + GUI deps (offline pipeline + offscreen GUI)
+uv sync                 # core + GUI deps
 uv sync --extra live    # + arm-pyart / boto3 / s3fs / httpx / geopandas (live pulls)
 
-# Qt/VTK system libs (Debian/Ubuntu) + Xvfb for headless rendering:
-apt-get install -y libegl1 libgl1 libglx-mesa0 libgl1-mesa-dri libosmesa6 \
+# Qt/VTK system libs (Debian/Ubuntu):
+sudo apt-get install -y libegl1 libgl1 libglx-mesa0 libgl1-mesa-dri libosmesa6 \
   libxkbcommon0 libxcb-cursor0 libxrender1 libfontconfig1 xvfb
 
+# The Leaflet map window uses WebKitGTK (runs under the system python3):
+sudo apt-get install -y python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1 libwebkit2gtk-4.1-0
+
+# Optional PostGIS persistence:
 createdb storm_modeler && psql storm_modeler -c "CREATE EXTENSION postgis;"
 export PG_DSN="postgresql:///storm_modeler?host=/var/run/postgresql"
 ```
 
-TimescaleDB is used for the time columns when available; the schema degrades
-gracefully to plain b-tree indexes otherwise.
+Notable env vars: `PG_DSN` (persistence; omit to run without a DB),
+`STORM_MODELER_DL_WORKERS` (concurrent downloads, default 4),
+`STORM_MODELER_GTK_PYTHON` (interpreter for the map process, default
+`/usr/bin/python3`), `STORM_MODELER_LOG_DIR`, `STORM_MODELER_CACHE`.
 
 ## Run
 
 ```bash
-uv run python -m storm_modeler.app                         # interactive GUI
-uv run python -m storm_modeler.app --replay <fixture_dir>  # GUI preloaded w/ fixtures
+uv run python -m storm_modeler.app                        # interactive GUI
 uv run python -m storm_modeler.app --from 2024-05-25T17:00Z --to 2024-05-25T19:00Z
+uv run python -m storm_modeler.app --headless --replay <dir> [--persist]   # no-GUI replay
 ```
 
-## Validation
+Search a warning, hit **Download**, then click a storm to drive the 3D view +
+map. Press **P** to cycle products; use the scrubber to loop the volumes.
 
-### 8A — A1 headless spine
+## Tests
 
 ```bash
-# settings round-trip drives detection (no code edit):
-uv run python -m storm_modeler.tools.set_setting seed_dbz 70
-uv run python -m storm_modeler.app --headless --replay src/storm_modeler/tests/fixtures/tornado_warning_case/ --persist
-psql "$PG_DSN" -c "select count(*) from cells_v2;"           # -> 0 (peak < 70 dBZ)
-uv run python -m storm_modeler.tools.set_setting seed_dbz 50
-uv run python -m storm_modeler.app --headless --replay src/storm_modeler/tests/fixtures/tornado_warning_case/ --persist
-psql "$PG_DSN" -c "select w.event, count(distinct c.track_id) storms, max(c.depth_km) d
-  from warnings_v2 w join cells_v2 c on c.warning_id=w.id group by w.event;"   # realistic storms
-
-# IEM filter admits only TO/SV·W (needs --extra live + network):
-uv run python -m storm_modeler.tools.iem_query --sts 2024-05-06T18:00Z --ets 2024-05-07T06:00Z --dump
-
-# AP false-seed audit:
-uv run python -m storm_modeler.app --headless --replay src/storm_modeler/tests/fixtures/ap_case/ --persist
-psql "$PG_DSN" -c "select count(*) from cells_v2 where site='KHGX' and valid_time='2026-06-24 11:41:00Z';"  # -> 0
-
-# cancel keeps committed volumes:
-uv run python -m storm_modeler.tools.download_warning --fixture tornado_warning_case --cancel-after 5
-psql "$PG_DSN" -c "select count(distinct valid_time) from cells_v2 where warning_id=(select id from warnings_v2 limit 1);"  # -> 5
+uv run pytest                                              # unit + integration
+QT_QPA_PLATFORM=offscreen uv run python -m storm_modeler.app --smoke   # builds every pane, exit 0
 ```
 
-### 8B — A2 GUI
-
-```bash
-QT_QPA_PLATFORM=offscreen uv run python -m storm_modeler.app --smoke   # exit 0; all panes + dialogs instantiate
-
-QT_QPA_PLATFORM=offscreen uv run pytest    # unit + integration suite
-```
-
-## Regenerate shipped data / fixtures
-
-```bash
-uv run python scripts/make_basemap.py    # data/shapefiles/*.geojson
-uv run python scripts/make_fixtures.py   # tests/fixtures/{tornado_warning_case,ap_case}
-```
-
-## Notes on this environment
-
-The pipeline is exercised entirely offline through the deterministic fixtures
-(the IEM and S3 archives are unreachable from the build container, and real
-Level II volumes are neither deterministic nor small). The live
-`IEMHistoricalSource` / `NexradArchiveSource` are implemented to spec and lazily
-import the `live` extra so they cost nothing on the offline path. The offscreen
-`--smoke` starts a private Xvfb so VTK renders against a stable software-GL
-context regardless of the host's offscreen-GL quality.
+Tests are hermetic and need no network: the deterministic replay cases are
+generated on the fly into a temp dir by `data/synthetic.py` (no synthetic data
+ships in the repo, so it is never mistaken for a real download).

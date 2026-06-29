@@ -1,8 +1,7 @@
-"""End-to-end (offline, no DB) pipeline tests over the shipped fixtures."""
+"""End-to-end (offline, no DB) pipeline tests over generated replay cases."""
 
 from __future__ import annotations
 
-from storm_modeler.config import FIXTURE_DIR
 from storm_modeler.pipeline import replay_fixture
 from storm_modeler.settings.resolver import resolve_from_values
 
@@ -10,10 +9,8 @@ from storm_modeler.settings.resolver import resolve_from_values
 DEFAULTS = resolve_from_values({})
 
 
-def test_tornado_fixture_tracks_a_deep_cell():
-    s = replay_fixture(
-        FIXTURE_DIR / "tornado_warning_case", persist=False, settings=DEFAULTS
-    )
+def test_tornado_fixture_tracks_a_deep_cell(tornado_case):
+    s = replay_fixture(tornado_case, persist=False, settings=DEFAULTS)
     assert s.warnings == 1
     assert s.volumes == 9
     assert s.cells == s.volumes  # one tracked cell per volume
@@ -35,16 +32,16 @@ def test_tornado_fixture_tracks_a_deep_cell():
             )
 
 
-def test_ap_fixture_admits_zero_cells():
-    s = replay_fixture(FIXTURE_DIR / "ap_case", persist=False, settings=DEFAULTS)
+def test_ap_fixture_admits_zero_cells(ap_case):
+    s = replay_fixture(ap_case, persist=False, settings=DEFAULTS)
     assert s.warnings == 1
     assert s.volumes == 1
     assert s.cells == 0
 
 
-def test_replay_is_deterministic():
-    a = replay_fixture(FIXTURE_DIR / "tornado_warning_case", persist=False, settings=DEFAULTS)
-    b = replay_fixture(FIXTURE_DIR / "tornado_warning_case", persist=False, settings=DEFAULTS)
+def test_replay_is_deterministic(tornado_case):
+    a = replay_fixture(tornado_case, persist=False, settings=DEFAULTS)
+    b = replay_fixture(tornado_case, persist=False, settings=DEFAULTS)
     da = [c.to_dict() for r in a.results for c in r.cells]
     db = [c.to_dict() for r in b.results for c in r.cells]
     assert da == db

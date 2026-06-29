@@ -22,7 +22,8 @@ from ..pipeline import VolumeResult, replay_fixture
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="download_warning")
-    p.add_argument("--fixture", required=True, help="fixture name under tests/fixtures")
+    p.add_argument("--fixture", required=True,
+                   help="path to a replay directory (warning.json + volumes/*.npz)")
     p.add_argument("--cancel-after", type=int, default=0,
                    help="cancel after N committed volumes (0 = no cancel)")
     p.add_argument("--no-persist", action="store_true", help="skip PostGIS writes")

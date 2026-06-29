@@ -135,3 +135,86 @@ def make_ap_volume(
         lat0=lat0,
         lon0=lon0,
     )
+
+
+# ---------------------------------------------------------------------------
+# Replay-case builders (used by the test suite + the GUI smoke test).
+#
+# These write a self-contained replay directory (warning.json + volumes/*.npz)
+# — the same layout DownloadStore/FixtureVolumeSource read. They are generated
+# on demand into a temp dir; no synthetic data is shipped in the repo (it was
+# too easily mistaken for a real download).
+# ---------------------------------------------------------------------------
+
+def _box(lon, lat, dlon=0.30, dlat=0.30):
+    from shapely.geometry import Polygon
+
+    return Polygon([
+        (lon - dlon, lat - dlat), (lon + dlon, lat - dlat),
+        (lon + dlon, lat + dlat), (lon - dlon, lat + dlat),
+    ])
+
+
+def _write_warning(path, **fields) -> None:
+    import json
+
+    from shapely.geometry import mapping
+
+    fields["polygon"] = mapping(fields["polygon"])
+    path.write_text(json.dumps(fields, indent=2))
+
+
+def build_tornado_case(root):
+    """A KFWS tornado warning: nine volumes, one deep cell tracking NE."""
+    from pathlib import Path
+
+    from .sites import get_site
+
+    d = Path(root) / "tornado_warning_case"
+    (d / "volumes").mkdir(parents=True, exist_ok=True)
+    s = get_site("KFWS")
+    poly = _box(s.lon + 0.15, s.lat + 0.07, 0.35, 0.30)
+    _write_warning(
+        d / "warning.json", id="2024-05-25-FWD-TOW-0084", event="Tornado Warning",
+        phenomena="TO", significance="W", wfo="FWD", etn=84,
+        ugc=["TXC201", "TXC439"], states=["TX"], polygon=poly,
+        issued="2024-05-25T11:41:00Z", expires="2024-05-25T12:15:00Z",
+    )
+    steps = [
+        ("2024-05-25T11:42:00Z", 0.06, 0.02), ("2024-05-25T11:48:00Z", 0.10, 0.05),
+        ("2024-05-25T11:54:00Z", 0.14, 0.08), ("2024-05-25T12:00:00Z", 0.18, 0.11),
+        ("2024-05-25T12:06:00Z", 0.22, 0.14), ("2024-05-25T12:12:00Z", 0.26, 0.17),
+        ("2024-05-25T12:18:00Z", 0.30, 0.20), ("2024-05-25T12:24:00Z", 0.34, 0.23),
+        ("2024-05-25T12:30:00Z", 0.38, 0.26),
+    ]
+    for i, (t, dlon, dlat) in enumerate(steps, 1):
+        vol = make_storm_volume(
+            "KFWS", s.lat, s.lon, t, core_lon=s.lon + dlon, core_lat=s.lat + dlat,
+            peak_dbz=57.5, echo_top_km=9.7,
+        )
+        vol.save_npz(d / "volumes" / f"v_{i:03d}.npz")
+    return d
+
+
+def build_ap_case(root):
+    """A KHGX warning whose single volume is pure AP (SCIT admits zero cells)."""
+    from pathlib import Path
+
+    from .sites import get_site
+
+    d = Path(root) / "ap_case"
+    (d / "volumes").mkdir(parents=True, exist_ok=True)
+    s = get_site("KHGX")
+    poly = _box(s.lon + 0.05, s.lat + 0.10, 0.30, 0.30)
+    _write_warning(
+        d / "warning.json", id="2026-06-24-HGX-SVW-0117",
+        event="Severe Thunderstorm Warning", phenomena="SV", significance="W",
+        wfo="HGX", etn=117, ugc=["TXC201"], states=["TX"], polygon=poly,
+        issued="2026-06-24T11:00:00Z", expires="2026-06-24T11:45:00Z",
+    )
+    vol = make_ap_volume(
+        "KHGX", s.lat, s.lon, "2026-06-24T11:41:00Z",
+        core_lon=s.lon + 0.05, core_lat=s.lat + 0.10, peak_dbz=52.0,
+    )
+    vol.save_npz(d / "volumes" / "v_001.npz")
+    return d

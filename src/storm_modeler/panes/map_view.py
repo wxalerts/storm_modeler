@@ -1,24 +1,48 @@
-"""Map pane — VTK orthographic top-down view.
+"""Map pane — 2D radar viewer on a ``QGraphicsView`` (pure-Qt raster).
 
-A ``pyvistaqt.QtInteractor`` rendering, all in planar lon/lat space at ``z=0``:
+A slippy-map-style top-down view that behaves like Leaflet: click-drag to pan,
+scroll wheel to zoom, **no** 3D rotation. It renders with Qt's raster engine
+(no OpenGL, no Chromium) — Qt WebEngine paints a black surface on this machine's
+GL stack, so an embedded web map is not an option here.
 
-* the vector basemap (counties + states + highways) as polylines;
-* the self-rendered composite reflectivity from the gridded volume (NWS dBZ
-  colours, geo-aligned RGBA) — never a tile server;
-* cell envelopes as polygons, with the selected cell highlighted;
+Everything is placed in one lon/lat-derived scene coordinate system, so the
+layers line up exactly:
+
+* the offline vector basemap (counties / states / highways) as cosmetic-pen
+  paths over a dark background;
+* the composite reflectivity, warped to a lon/lat raster (NWS dBZ colours) and
+  dropped in as a pixmap at its geographic bounds;
+* the SCIT cell envelopes, with the selected cell bolded;
 * the warning polygon for reference.
 
-Clicking a storm in the nav pane recenters and highlights it here.
+Scene coords are ``x = lon·cos(LAT_REF)``, ``y = -lat`` (north up), with a fixed
+reference latitude so the aspect ratio is roughly geographic across CONUS.
 """
 
 from __future__ import annotations
 
-import os
+import math
 
 import numpy as np
 import structlog
-from PySide6.QtWidgets import QVBoxLayout, QWidget
-from shapely.geometry import Polygon
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
+from PySide6.QtWidgets import (
+    QGraphicsPathItem,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsView,
+    QVBoxLayout,
+    QWidget,
+)
 
 from ..data import basemap as basemap_mod
 from ..data import radar_render
@@ -28,210 +52,225 @@ from ..models import GriddedVolume, Warning
 
 log = structlog.get_logger(__name__)
 
+#: Fixed reference latitude for the lon aspect correction (CONUS mid-latitude).
+LAT_REF = 38.0
+_SX = math.cos(math.radians(LAT_REF))
 
-def _polygon_to_lines(poly: Polygon, z: float = 0.01):
-    """Closed polyline mesh of a polygon exterior at height ``z``."""
-    import pyvista as pv
+# Z ordering.
+_Z_BASEMAP = 0
+_Z_RADAR = 1
+_Z_CELLS = 2
+_Z_WARNING = 3
+_Z_HIGHLIGHT = 4
 
-    coords = np.asarray(poly.exterior.coords)
-    n = coords.shape[0]
-    pts = np.hstack([coords[:, :2], np.full((n, 1), z)])
-    mesh = pv.PolyData()
-    mesh.points = pts
-    mesh.lines = np.asarray([n] + list(range(n)))
-    return mesh
+
+def _qcolor(rgb01, alpha: int = 255) -> QColor:
+    r, g, b = rgb01
+    return QColor(int(r * 255), int(g * 255), int(b * 255), alpha)
+
+
+def _sx(lon):
+    return np.asarray(lon, dtype=np.float64) * _SX
+
+
+class _MapView(QGraphicsView):
+    """A non-rotating pan/zoom view: drag pans, wheel zooms, that's it."""
+
+    def __init__(self, scene, parent=None) -> None:
+        super().__init__(scene, parent)
+        self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
+        self.setBackgroundBrush(QBrush(QColor("#0e1117")))
+        # y grows downward in scene space already (we negate lat), so no flip.
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        factor = 1.25 if event.angleDelta().y() > 0 else 1 / 1.25
+        self.scale(factor, factor)
 
 
 class MapPane(QWidget):
     def __init__(self, parent: QWidget | None = None, off_screen: bool | None = None) -> None:
         super().__init__(parent)
-        import pyvista as pv
-        from pyvistaqt import QtInteractor
-
-        # A real display (an X server, incl. Xvfb) means VTK has a working GL
-        # context and we render live — this holds even under the Qt "offscreen"
-        # platform, where the QWidget is windowless but VTK drives its own GL
-        # window on DISPLAY. With no display at all we fall back to an offscreen
-        # GL buffer and skip live renders (see _allow_render).
-        if off_screen is None:
-            off_screen = not os.environ.get("DISPLAY")
-        self.off_screen = off_screen
-        # Live GL renders are only performed when there is a real display.
-        # Offscreen software GL on some headless stacks intermittently aborts
-        # during shader compilation; in that mode we still build every actor
-        # (so the panes are fully instantiated) but skip the render() calls.
-        self._allow_render = not off_screen
-        self.plotter = QtInteractor(self, off_screen=off_screen)
-        if off_screen:
-            # The interactor widget is never shown offscreen, so its viewport
-            # would be 0x0 — force a real render-window size so VTK allocates a
-            # valid framebuffer instead of aborting on a zero-length array.
-            try:
-                self.plotter.ren_win.SetSize(1024, 768)
-            except Exception:  # noqa: BLE001
-                pass
+        self.scene = QGraphicsScene(self)
+        self.view = _MapView(self.scene, self)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.plotter.interactor)
+        layout.addWidget(self.view)
 
-        self._radar_actor = None
-        self._warning_actor = None
-        self._cell_actors: list = []
-        self._highlight_actor = None
-        self._extent: tuple[float, float, float, float] | None = None
+        self._basemap_items: list = []
+        self._radar_item: QGraphicsPixmapItem | None = None
+        self._radar_img: QImage | None = None  # keep the backing buffer alive
+        self._warning_item: QGraphicsPathItem | None = None
+        self._cell_items: list = []
+        self._highlight_item: QGraphicsPathItem | None = None
+        self._extent: QRectF | None = None  # radar footprint, scene coords
 
-        try:
-            self.plotter.set_background("black")
-            self.plotter.enable_parallel_projection()
-            self.plotter.view_xy()
-        except Exception as e:  # noqa: BLE001 - headless GL may be limited
-            log.info("map.init_render_skipped", reason=str(e).splitlines()[0])
+    # --- geometry helpers -------------------------------------------------
+
+    @staticmethod
+    def _path_from_polylines(polylines) -> QPainterPath:
+        path = QPainterPath()
+        for pl in polylines:
+            pl = np.asarray(pl)
+            if pl.ndim != 2 or pl.shape[0] < 2:
+                continue
+            xs = pl[:, 0] * _SX
+            ys = -pl[:, 1]
+            path.moveTo(float(xs[0]), float(ys[0]))
+            for i in range(1, len(xs)):
+                path.lineTo(float(xs[i]), float(ys[i]))
+        return path
+
+    def _polygon_path(self, poly) -> QPainterPath:
+        return self._path_from_polylines([np.asarray(poly.exterior.coords)])
 
     # --- layers -----------------------------------------------------------
 
     def set_basemap(self, shapefile_dir=None) -> None:
+        for it in self._basemap_items:
+            self.scene.removeItem(it)
+        self._basemap_items.clear()
         layers = basemap_mod.read_all_layers(shapefile_dir)
         for name, polylines in layers.items():
-            poly = basemap_mod.polylines_to_polydata(polylines, z=0.0)
-            if poly is None:
+            if not polylines:
                 continue
             style = LAYER_STYLE.get(name, {"color": (0.6, 0.6, 0.6), "line_width": 1.0})
-            self._safe_add(poly, color=style["color"], line_width=style["line_width"])
+            item = QGraphicsPathItem(self._path_from_polylines(polylines))
+            pen = QPen(_qcolor(style["color"]))
+            pen.setWidthF(style["line_width"])
+            pen.setCosmetic(True)  # constant pixel width regardless of zoom
+            item.setPen(pen)
+            item.setZValue(_Z_BASEMAP)
+            self.scene.addItem(item)
+            self._basemap_items.append(item)
+        log.info("map.basemap_built", layers=[k for k, v in layers.items() if v])
 
     def show_warning(self, warning: Warning) -> None:
-        if self._warning_actor is not None:
-            self._safe_remove(self._warning_actor)
-        mesh = _polygon_to_lines(warning.polygon, z=0.02)
-        self._warning_actor = self._safe_add(
-            mesh, color=(1.0, 1.0, 1.0), line_width=2.5
-        )
+        if self._warning_item is not None:
+            self.scene.removeItem(self._warning_item)
+        item = QGraphicsPathItem(self._polygon_path(warning.polygon))
+        pen = QPen(QColor("#ffffff"))
+        pen.setWidthF(2.5)
+        pen.setCosmetic(True)
+        item.setPen(pen)
+        item.setBrush(QBrush(Qt.NoBrush))
+        item.setZValue(_Z_WARNING)
+        self.scene.addItem(item)
+        self._warning_item = item
 
     def set_radar(self, volume: GriddedVolume) -> None:
-        if self._radar_actor is not None:
-            self._safe_remove(self._radar_actor)
-        grid = radar_render.radar_polydata(volume, z=0.0)
-        self._radar_actor = self._safe_add(
-            grid, scalars="rgba", rgba=True, show_scalar_bar=False
+        if self._radar_item is not None:
+            self.scene.removeItem(self._radar_item)
+        rgba, (lat_min, lon_min, lat_max, lon_max) = radar_render.composite_lonlat_image(
+            volume
         )
-        self._extent = radar_render.geo_bounds(volume)
+        h, w, _ = rgba.shape
+        buf = np.ascontiguousarray(rgba)
+        img = QImage(buf.data, w, h, 4 * w, QImage.Format_RGBA8888)
+        self._radar_img = img  # keep buffer ref; QImage does not copy
+        self._radar_buf = buf
+        item = QGraphicsPixmapItem(QPixmap.fromImage(img))
+        item.setTransformationMode(Qt.SmoothTransformation)
+        item.setOpacity(0.78)
+        item.setZValue(_Z_RADAR)
+        # Map pixel (0,0)=NW=(lon_min, lat_max) → scene; scale to the footprint.
+        from PySide6.QtGui import QTransform
+
+        t = QTransform()
+        t.translate(lon_min * _SX, -lat_max)
+        t.scale((lon_max - lon_min) * _SX / w, (lat_max - lat_min) / h)
+        item.setTransform(t)
+        self.scene.addItem(item)
+        self._radar_item = item
+        self._extent = QRectF(
+            QPointF(lon_min * _SX, -lat_max), QPointF(lon_max * _SX, -lat_min)
+        ).normalized()
 
     def add_cells(self, cells: list[StormCell]) -> None:
+        for it in self._cell_items:
+            self.scene.removeItem(it)
+        self._cell_items.clear()
+        pen = QPen(QColor("#ffff00"))
+        pen.setWidthF(2.0)
+        pen.setCosmetic(True)
         for c in cells:
-            mesh = _polygon_to_lines(c.envelope, z=0.03)
-            actor = self._safe_add(mesh, color=(1.0, 1.0, 0.0), line_width=2.0)
-            if actor is not None:
-                self._cell_actors.append(actor)
+            item = QGraphicsPathItem(self._polygon_path(c.envelope))
+            item.setPen(pen)
+            item.setBrush(QBrush(Qt.NoBrush))
+            item.setZValue(_Z_CELLS)
+            self.scene.addItem(item)
+            self._cell_items.append(item)
 
-    def _clear_cells(self) -> None:
-        for actor in self._cell_actors:
-            self._safe_remove(actor)
-        self._cell_actors.clear()
+    def highlight_cell(self, cell: StormCell) -> None:
+        if self._highlight_item is not None:
+            self.scene.removeItem(self._highlight_item)
+        item = QGraphicsPathItem(self._polygon_path(cell.envelope))
+        pen = QPen(QColor("#ffffff"))
+        pen.setWidthF(4.0)
+        pen.setCosmetic(True)
+        item.setPen(pen)
+        item.setBrush(QBrush(Qt.NoBrush))
+        item.setZValue(_Z_HIGHLIGHT)
+        self.scene.addItem(item)
+        self._highlight_item = item
+        # Frame the selected cell with a little context.
+        lon0, lat0, lon1, lat1 = cell.envelope.bounds
+        self._fit_lonlat(lon0, lat0, lon1, lat1, pad_frac=1.5)
+
+    # --- composite operations --------------------------------------------
 
     def show_result(self, warning: Warning, volume: GriddedVolume, cells) -> None:
-        log.info("map.show_result.begin", valid_time=volume.valid_time.isoformat(),
-                 n_cells=len(list(cells)), allow_render=self._allow_render)
+        cells = list(cells)
+        log.info("map.show_result", valid_time=volume.valid_time.isoformat(),
+                 n_cells=len(cells))
         self.show_warning(warning)
         self.set_radar(volume)
-        self._clear_cells()
-        self.add_cells(list(cells))
-        # Frame the warning (the storm of interest), not the whole radar disc —
-        # the chosen radar can be 100+ km away, leaving the warning at the edge.
+        self.add_cells(cells)
         self.fit_to_warning(warning)
-        log.info("map.show_result.done", valid_time=volume.valid_time.isoformat())
-
-    def fit_to_warning(self, warning: Warning) -> None:
-        """Center and zoom the camera on the warning polygon (+ context margin)."""
-        try:
-            lon0, lat0, lon1, lat1 = warning.polygon.bounds
-            cx, cy = (lon0 + lon1) / 2.0, (lat0 + lat1) / 2.0
-            # Half-height of the viewport: the larger warning dimension plus a
-            # margin so nearby radar echoes around the storm stay in frame.
-            half = max(lon1 - lon0, lat1 - lat0, 0.4) * 0.9 + 0.25
-            self.recenter(cx, cy, span_deg=half)
-        except Exception as e:  # noqa: BLE001
-            log.info("map.fit_warning_skipped", reason=str(e).splitlines()[0])
-            self.fit_view()
-
-    # --- interaction ------------------------------------------------------
 
     def show_cell_selection(
         self, warning: Warning, volume: GriddedVolume, cells, cell: StormCell
     ) -> None:
-        """Switch the map to a selected cell's volume.
-
-        Swaps the radar layer to that volume's reflectivity, redraws that
-        volume's cell envelopes, then highlights and recenters on the chosen
-        cell. This is what makes the map track the volume you click in the
-        navigator (the radar previously stayed on the last downloaded volume).
-        """
-        log.info("map.select_cell.begin", valid_time=volume.valid_time.isoformat(),
-                 cell_id=cell.cell_id, allow_render=self._allow_render)
+        cells = list(cells)
+        log.info("map.select_cell", valid_time=volume.valid_time.isoformat(),
+                 cell_id=cell.cell_id)
         self.show_warning(warning)
         self.set_radar(volume)
-        self._clear_cells()
-        self.add_cells(list(cells))
+        self.add_cells(cells)
         self.highlight_cell(cell)
-        log.info("map.select_cell.done", valid_time=volume.valid_time.isoformat())
 
-    def highlight_cell(self, cell: StormCell) -> None:
-        """Recenter on a cell and draw a bold highlight on its envelope."""
-        if self._highlight_actor is not None:
-            self._safe_remove(self._highlight_actor)
-        mesh = _polygon_to_lines(cell.envelope, z=0.05)
-        self._highlight_actor = self._safe_add(
-            mesh, color=(1.0, 1.0, 1.0), line_width=5.0
-        )
-        self.recenter(cell.seed_lon, cell.seed_lat, span_deg=0.8)
+    # --- framing ----------------------------------------------------------
+
+    def _fit_lonlat(self, lon0, lat0, lon1, lat1, pad_frac: float = 0.25) -> None:
+        x0, x1 = sorted([lon0 * _SX, lon1 * _SX])
+        y0, y1 = sorted([-lat0, -lat1])
+        dx = max(x1 - x0, 1e-3)
+        dy = max(y1 - y0, 1e-3)
+        rect = QRectF(x0 - dx * pad_frac, y0 - dy * pad_frac,
+                      dx * (1 + 2 * pad_frac), dy * (1 + 2 * pad_frac))
+        self.view.fitInView(rect, Qt.KeepAspectRatio)
+
+    def fit_to_warning(self, warning: Warning) -> None:
+        lon0, lat0, lon1, lat1 = warning.polygon.bounds
+        self._fit_lonlat(lon0, lat0, lon1, lat1, pad_frac=0.35)
 
     def recenter(self, lon: float, lat: float, span_deg: float = 1.5) -> None:
-        try:
-            cam = self.plotter.camera
-            cam.focal_point = (lon, lat, 0.0)
-            cam.position = (lon, lat, 100.0)
-            cam.up = (0.0, 1.0, 0.0)
-            cam.parallel_scale = span_deg
-            if self._allow_render:
-                self.plotter.render()
-        except Exception as e:  # noqa: BLE001
-            log.info("map.recenter_skipped", reason=str(e).splitlines()[0])
+        self._fit_lonlat(lon - span_deg, lat - span_deg,
+                         lon + span_deg, lat + span_deg, pad_frac=0.0)
 
     def fit_view(self) -> None:
-        try:
-            if self._extent is not None:
-                lon0, lon1, lat0, lat1 = self._extent
-                self.recenter(
-                    (lon0 + lon1) / 2,
-                    (lat0 + lat1) / 2,
-                    span_deg=max(lon1 - lon0, lat1 - lat0) / 2 * 1.1,
-                )
-            elif self._allow_render:
-                self.plotter.reset_camera()
-                self.plotter.render()
-        except Exception as e:  # noqa: BLE001
-            log.info("map.fit_skipped", reason=str(e).splitlines()[0])
+        if self._extent is not None:
+            self.view.fitInView(self._extent, Qt.KeepAspectRatio)
 
     def clear(self) -> None:
-        try:
-            self.plotter.clear()
-        except Exception:  # noqa: BLE001
-            pass
-        self._radar_actor = None
-        self._warning_actor = None
-        self._cell_actors.clear()
-        self._highlight_actor = None
+        for it in (self._cell_items + [self._radar_item, self._warning_item,
+                                       self._highlight_item]):
+            if it is not None:
+                self.scene.removeItem(it)
+        self._cell_items.clear()
+        self._radar_item = None
+        self._warning_item = None
+        self._highlight_item = None
         self._extent = None
-
-    # --- guarded plotter ops (headless GL tolerance) ----------------------
-
-    def _safe_add(self, mesh, **kw):
-        try:
-            return self.plotter.add_mesh(mesh, **kw)
-        except Exception as e:  # noqa: BLE001
-            log.info("map.add_mesh_skipped", reason=str(e).splitlines()[0])
-            return None
-
-    def _safe_remove(self, actor) -> None:
-        try:
-            self.plotter.remove_actor(actor)
-        except Exception:  # noqa: BLE001
-            pass

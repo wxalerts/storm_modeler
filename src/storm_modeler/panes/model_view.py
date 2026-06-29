@@ -81,6 +81,10 @@ class _GridLoadTask(QRunnable):
 
 
 class ModelPane(QWidget):
+    # Emitted for each scrub/playback frame so the map can follow the 3D view in
+    # lock-step: (volume, emphasis cell, all cells in that volume).
+    frame_ready = Signal(object, object, object)
+
     def __init__(
         self,
         settings: ResolvedSettings | None = None,
@@ -261,11 +265,11 @@ class ModelPane(QWidget):
         )
 
     def _advance(self) -> None:
+        # Loop: wrap back to the first volume at the end (continuous radar loop).
         if self._slider.value() >= self._slider.maximum():
-            self._play_timer.stop()
-            self._set_play_icon(False)
-            return
-        self._slider.setValue(self._slider.value() + 1)
+            self._slider.setValue(0)
+        else:
+            self._slider.setValue(self._slider.value() + 1)
 
     def _toggle_play(self) -> None:
         if self._play_timer.isActive():
@@ -306,6 +310,8 @@ class ModelPane(QWidget):
         self._build_3d(volume, emphasis, cells, reset_cam=self._pending_reset_cam)
         self._build_xsection(volume, emphasis)
         self._time_label.setText(_z(volume.valid_time))
+        # Drive the map in lock-step with this 3D frame (radar + cells follow).
+        self.frame_ready.emit(volume, emphasis, cells)
 
     @Slot(int, str)
     def _on_grid_failed(self, req_id: int, message: str) -> None:
@@ -354,13 +360,35 @@ class ModelPane(QWidget):
             # place; only frame it on a fresh selection.
             if reset_cam or not self._cam_initialised:
                 self.plotter.view_isometric()
-                self.plotter.camera.zoom(1.4)
+                self._frame_camera_on_cell(volume, cell)
                 self._cam_initialised = True
             if self._allow_render:
                 self.plotter.render()
         except Exception as e:  # noqa: BLE001
             log.info("model.render_skipped", reason=str(e).splitlines()[0])
         log.info("model.build_3d.done", cell_id=cell.cell_id)
+
+    def _frame_camera_on_cell(self, volume, cell: StormCell) -> None:
+        """Frame the isometric camera on the selected cell, not the whole domain.
+
+        ``view_isometric`` fits *every* actor — including the faint other-cell
+        prisms scattered across the 300 km grid — which shrinks the storm of
+        interest into a corner. Reset to a bounding box around just this cell's
+        ROI (its footprint + padding, ground to echo top) so it sits centred.
+        """
+        from ..viz.scene_builder import roi_window_km
+
+        ve = self._viewer.vert_exag
+        w = roi_window_km(volume, cell)
+        cx, cy = cell.seed_x / 1000.0, cell.seed_y / 1000.0
+        ztop = max(cell.echo_top_km, 0.1) * ve
+        bounds = (cx - w, cx + w, cy - w, cy + w, 0.0, ztop)
+        try:
+            self.plotter.reset_camera(bounds=bounds)
+            self.plotter.camera.zoom(1.1)
+        except Exception as e:  # noqa: BLE001
+            log.info("model.frame_skipped", reason=str(e).splitlines()[0])
+            self.plotter.camera.zoom(1.4)
 
     def _build_xsection(self, volume, cell: StormCell) -> None:
         log.info("model.build_xsection.begin", cell_id=cell.cell_id)
