@@ -18,6 +18,8 @@ Protocol: one JSON object per line on stdin. Commands:
     {"cmd": "satellite_clear"}
     {"cmd": "satellite_opacity", "value": 0.55}  # BT overlay opacity 0..1
     {"cmd": "cloudtops",  "geojson": {...}}  # cloud-top cells (anvil/OT markers)
+    {"cmd": "stormtrack", "geojson": {...}}  # one storm's history (line + dots)
+    {"cmd": "stormtrack_clear"}
     {"cmd": "fit",       "bounds": [[s,w],[n,e]]}
     {"cmd": "clear"}
     {"cmd": "snapshot",  "path": "/tmp/x.png"}   # test aid
@@ -58,7 +60,7 @@ L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/
 L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
             {maxZoom:18}).addTo(map);
 var radarLayer=null, warningLayer=null, cellsLayer=null, hiLayer=null, lightningLayer=null;
-var satLayer=null, cloudtopLayer=null;
+var satLayer=null, cloudtopLayer=null, trackLayer=null;
 // Canvas renderer: thousands of flash markers paint far faster than SVG.
 var lightningCanvas = L.canvas({padding:0.5});
 function setRadar(url, b){ if(radarLayer)map.removeLayer(radarLayer);
@@ -100,13 +102,27 @@ function setCloudtops(gj){ if(cloudtopLayer)map.removeLayer(cloudtopLayer);
       if(p.tilt_km!==undefined)s+=' · tilt '+p.tilt_km+' km @ '+p.tilt_bearing_deg+'°';
       l.bindPopup(s);}
   }).addTo(map);}
+// Storm track: an orange polyline through the storm's history with a dot per
+// volume (overshooting-top volumes larger + red). Popups carry time/dBZ/top.
+function setStormTrack(gj){ if(trackLayer)map.removeLayer(trackLayer);
+  trackLayer=L.geoJSON(gj,{
+    style:function(f){return {color:'#ff8c1a',weight:3,opacity:0.9};},
+    pointToLayer:function(f,ll){var ot=f.properties.kind==='ot';
+      return L.circleMarker(ll,{radius:ot?7:4,color:ot?'#ff3030':'#ff8c1a',
+        weight:2,fillColor:ot?'#ff3030':'#ffd24a',fillOpacity:0.9});},
+    onEachFeature:function(f,l){var p=f.properties;if(p.kind==='line')return;
+      var s=p.time+' · '+p.dbz+' dBZ · top '+p.top_km+' km';
+      if(p.kind==='ot')s+=' · OT';l.bindPopup(s);}
+  }).addTo(map);}
+function clearStormTrack(){ if(trackLayer)map.removeLayer(trackLayer);
+  trackLayer=null;}
 function fitBounds(b){ map.fitBounds(b,{padding:[25,25], animate:false}); }
 function panTo(lat, lon){ map.panTo([lat,lon],{animate:false}); }
 function setProduct(p){ document.getElementById('prod').textContent = p; }
 function clearAll(){ [radarLayer,warningLayer,cellsLayer,hiLayer,lightningLayer,
-  satLayer,cloudtopLayer].forEach(function(l){if(l)map.removeLayer(l);});
+  satLayer,cloudtopLayer,trackLayer].forEach(function(l){if(l)map.removeLayer(l);});
   radarLayer=warningLayer=cellsLayer=hiLayer=lightningLayer=null;
-  satLayer=cloudtopLayer=null;}
+  satLayer=cloudtopLayer=trackLayer=null;}
 </script></body></html>"""
 
 
@@ -196,6 +212,10 @@ class MapApp:
             self._js(f"setSatelliteOpacity({float(msg['value'])});")
         elif cmd == "cloudtops":
             self._js(f"setCloudtops({json.dumps(msg['geojson'])});")
+        elif cmd == "stormtrack":
+            self._js(f"setStormTrack({json.dumps(msg['geojson'])});")
+        elif cmd == "stormtrack_clear":
+            self._js("clearStormTrack();")
         elif cmd == "fit":
             self._js(f"fitBounds({json.dumps(msg['bounds'])});")
         elif cmd == "pan":

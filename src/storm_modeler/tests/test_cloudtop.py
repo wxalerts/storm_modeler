@@ -92,7 +92,19 @@ def test_radar_association_tilt():
     assert abs(radar[0].cloud_top_c - (c.min_bt_k - 273.15)) < 1e-6
     assert radar[0].overshooting_top == c.overshooting_top
 
-
+def test_ot_attributed_to_nearest_core_only():
+    cells = ct.run(_scene())
+    assert cells[0].overshooting_top  # scene fixture has an OT
+    near = scit.run(make_storm_volume("KFWS", KFWS.lat, KFWS.lon,
+        "2024-05-25T17:42:00Z", core_lon=cells[0].cold_lon + 0.03,
+        core_lat=cells[0].cold_lat, echo_top_km=12.0))[0]
+    far = scit.run(make_storm_volume("KFWS", KFWS.lat, KFWS.lon,
+        "2024-05-25T17:42:00Z", core_lon=cells[0].cold_lon + 0.20,
+        core_lat=cells[0].cold_lat, echo_top_km=10.0))[0]
+    ct.associate_radar(cells, [near, far], CloudTopParams())
+    assert near.overshooting_top and not far.overshooting_top
+    assert near.cloud_top_c is not None and far.cloud_top_c is not None  # temp still shared
+    
 def test_radar_association_skips_distant_cell():
     cells = ct.run(_scene())
     # A radar cell far outside assoc_max_km.

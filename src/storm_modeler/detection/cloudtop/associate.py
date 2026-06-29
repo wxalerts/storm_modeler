@@ -76,7 +76,10 @@ def associate_radar(
     if not radar:
         return cloudtop_cells
 
-    # 2. Match each radar cell to the cloud top that sits over it.
+    # 2. Match each radar cell to the cloud top that sits over it. Track the
+    #    radar core that owns each top by reference, not by track_id — untracked
+    #    cells share track_id == -1, which also flags an unmatched cloud top.
+    owner_of: dict[int, StormCell] = {}
     for r in radar:
         core = Point(r.seed_lon, r.seed_lat)
         covering = [
@@ -95,14 +98,25 @@ def associate_radar(
                 continue
 
         r.cloud_top_c = best.min_bt_k - 273.15
-        r.overshooting_top = best.overshooting_top
+        r.overshooting_top = False
 
         # Record storm tilt on the cloud top (closest core wins when shared).
+        # Track "claimed" via owner_of, not radar_track_id — untracked cells set
+        # radar_track_id to -1, which would otherwise read as never-claimed.
         d = haversine_km(r.seed_lon, r.seed_lat, best.cold_lon, best.cold_lat)
-        if best.radar_track_id == -1 or d < best.tilt_km:
+        if id(best) not in owner_of or d < best.tilt_km:
             best.radar_track_id = r.track_id
             best.tilt_km = d
             best.tilt_bearing_deg = initial_bearing_deg(
                 r.seed_lon, r.seed_lat, best.cold_lon, best.cold_lat
             )
+            owner_of[id(best)] = r
+    # Attribute each overshoot to the single radar core nearest its dome.
+    # owner_of holds the closest sharer (set by the tilt block), so the OT lands
+    # on the column under the dome — not every cell under the anvil.
+    for c in cloudtop_cells:
+        if c.overshooting_top:
+            owner = owner_of.get(id(c))
+            if owner is not None:
+                owner.overshooting_top = True
     return cloudtop_cells

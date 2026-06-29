@@ -287,6 +287,45 @@ class MapClient:
         """Set the brightness-temperature overlay opacity (0.0–1.0)."""
         self._send({"cmd": "satellite_opacity", "value": float(value)})
 
+    # --- storm tracks -----------------------------------------------------
+
+    def show_storm_track(self, track) -> None:
+        """Draw a storm track: a polyline through its history with a dot per
+        volume (overshooting-top volumes emphasised), and centre on its head.
+
+        ``track`` is a :class:`storm_modeler.tracks.StormTrack`. The geometry is
+        sent as GeoJSON — a single ``LineString`` plus one ``Point`` per sample,
+        carrying time/dBZ/OT in the properties for map popups.
+        """
+        samples = track.samples
+        feats = []
+        if len(samples) >= 2:
+            feats.append({
+                "type": "Feature", "properties": {"kind": "line"},
+                "geometry": {"type": "LineString",
+                             "coordinates": [[s.seed_lon, s.seed_lat]
+                                             for s in samples]},
+            })
+        for s in samples:
+            feats.append({
+                "type": "Feature",
+                "properties": {
+                    "kind": "ot" if s.overshooting_top else "pt",
+                    "time": s.valid_time.strftime("%H:%MZ"),
+                    "dbz": round(s.max_dbz, 1),
+                    "top_km": round(s.echo_top_km, 1),
+                },
+                "geometry": {"type": "Point",
+                             "coordinates": [s.seed_lon, s.seed_lat]},
+            })
+        self._send({"cmd": "stormtrack",
+                    "geojson": {"type": "FeatureCollection", "features": feats}})
+        last = samples[-1]
+        self._send({"cmd": "pan", "lat": last.seed_lat, "lon": last.seed_lon})
+
+    def clear_stormtrack(self) -> None:
+        self._send({"cmd": "stormtrack_clear"})
+
     def highlight_cell(self, cell: StormCell) -> None:
         # Recenter only — keep the user's current zoom while stepping volumes.
         self._send({"cmd": "highlight", "geojson": mapping(cell.envelope)})

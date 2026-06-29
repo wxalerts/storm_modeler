@@ -62,7 +62,7 @@ def run_headless(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _build_window(persist: bool):
+def _build_window(persist: bool, *, use_local_settings: bool = True):
     import threading
 
     from PySide6.QtCore import Qt, QSettings, QThreadPool
@@ -80,6 +80,7 @@ def _build_window(persist: bool):
     from .panes.logs_window import LogsWindow
     from .panes.model_view import ModelPane
     from .panes.satellite_pane import SatelliteWindow
+    from .panes.stormtrack_window import StormTrackWindow
     from .settings.resolver import resolve
     from .workers import LightningWorker, SatelliteWorker, SearchWorker, WarningWorker
 
@@ -91,10 +92,12 @@ def _build_window(persist: bool):
 
             self.dsn = pg_dsn() if persist else None
             # No database? Persist tuning to a local JSON file instead, so the
-            # Settings dialog survives restarts. (persist=False keeps the smoke
-            # test pure: no DSN, no file.)
+            # Settings dialog survives restarts. ``--persist`` only governs the
+            # PostGIS DSN; the local-file fallback is the default for the GUI so
+            # tuning sticks without a database. (The smoke test passes
+            # use_local_settings=False to stay pure: no DSN, no file.)
             self.settings_path = (
-                local_settings_path() if (persist and not self.dsn) else None
+                local_settings_path() if (use_local_settings and not self.dsn) else None
             )
             self.settings = resolve(self.dsn, self.settings_path)
             self.params = self.settings.detection
@@ -104,6 +107,7 @@ def _build_window(persist: bool):
             self._sources: dict[str, object] = {}   # warning.id -> () -> VolumeSource
             self._results: dict[str, list] = {}      # warning.id -> [VolumeResult]
             self._selected_id: str | None = None
+            self._selected_warning = None  # the warning object behind _selected_id
             # GLM lightning for the selected warning: all fetched flashes, their
             # full time span (for a stable colour ramp), and the valid_time of
             # the volume currently on the map (so only that volume's strikes show
@@ -153,12 +157,16 @@ def _build_window(persist: bool):
             # Satellite window (fetches GOES ABI cloud-top analysis onto the map).
             self.satellite_window = SatelliteWindow()
 
+            # Storm Track window (lists tracked storms + charts their history).
+            self.stormtrack_window = StormTrackWindow()
+
             # Persisted window geometry (position + size) across launches.
             self._geo = QSettings("WxAlerts", "StormModeler")
             self._geo_windows = {
                 "data": self, "model": self.model_window, "logs": self.logs_window,
                 "lightning": self.lightning_window,
                 "satellite": self.satellite_window,
+                "stormtrack": self.stormtrack_window,
             }
 
             self.setStatusBar(QStatusBar())
@@ -184,6 +192,8 @@ def _build_window(persist: bool):
             self.satellite_window.fetch_requested.connect(self.on_fetch_satellite)
             self.satellite_window.clear_requested.connect(self.map.clear_satellite)
             self.satellite_window.opacity_changed.connect(self.map.set_satellite_opacity)
+            self.stormtrack_window.track_selected.connect(self._on_track_selected)
+            self.stormtrack_window.clear_requested.connect(self.map.clear_stormtrack)
 
             # Repopulate the "Downloaded" list from the on-disk cache.
             self._load_persisted_downloads()
@@ -219,6 +229,8 @@ def _build_window(persist: bool):
                 lambda: self._raise_window(self.lightning_window))
             win_menu.addAction("Satellite").triggered.connect(
                 lambda: self._raise_window(self.satellite_window))
+            win_menu.addAction("Storm Tracks").triggered.connect(
+                lambda: self._raise_window(self.stormtrack_window))
             win_menu.addAction("Logs").triggered.connect(
                 lambda: self._raise_window(self.logs_window))
 
@@ -268,6 +280,7 @@ def _build_window(persist: bool):
                 self.logs_window.move(500, 600)
                 self.lightning_window.move(40, 620)
                 self.satellite_window.move(40, 880)
+                self.stormtrack_window.move(1280, 60)
             else:
                 for name, win in self._geo_windows.items():
                     g = self._geo.value(f"geometry/{name}")
@@ -277,6 +290,7 @@ def _build_window(persist: bool):
             self.logs_window.show()
             self.lightning_window.show()
             self.satellite_window.show()
+            self.stormtrack_window.show()
 
         def _save_geometry(self) -> None:
             for name, win in self._geo_windows.items():
@@ -291,6 +305,7 @@ def _build_window(persist: bool):
             self.logs_window.close()
             self.lightning_window.close()
             self.satellite_window.close()
+            self.stormtrack_window.close()
             from PySide6.QtWidgets import QApplication
             QApplication.instance().quit()
             super().closeEvent(event)
@@ -306,6 +321,54 @@ def _build_window(persist: bool):
             self.model.set_settings(self.settings)
             self.statusBar().showMessage(
                 f"Settings reloaded (detection hash {self.params.settings_hash})"
+            )
+            self._reprocess_current()
+
+        def _reprocess_current(self) -> None:
+            """Re-run SCIT detection + tracking on the selected warning, in memory.
+
+            Triggered live from the settings dialog (debounced, as the user edits)
+            and on its "Save and Reprocess" button. Runs entirely against the
+            already-gridded volumes cached in ``_results`` — no network, no
+            re-gridding, no download dialog — so a settings tweak re-detects in
+            near real time. Skips silently if nothing is loaded.
+            """
+            wid = self._selected_id
+            results = self._results.get(wid) if wid else None
+            if not results:
+                return
+
+            from .detection.detection_v2 import Tracker
+            from .detection.detection_v2 import run as scit_run
+            from .pipeline import VolumeResult
+
+            # Tracking is stateful across the volume sequence, so re-run the whole
+            # warning in chronological order through a fresh tracker.
+            tracker = Tracker(self.params)
+            rebuilt: list = []
+            for res in sorted(results, key=lambda r: r.volume.valid_time):
+                try:
+                    cells = scit_run(res.volume, self.params)
+                    tracker.update(cells, res.volume.valid_time)
+                except Exception as e:  # noqa: BLE001
+                    log.error("gui.reprocess_error", warning=wid, error=str(e))
+                    return
+                rebuilt.append(VolumeResult(
+                    warning=res.warning, site=res.site, volume=res.volume,
+                    cells=cells, index=res.index, total=res.total,
+                    settings_hash=self.params.settings_hash,
+                ))
+            self._results[wid] = rebuilt
+
+            # Refresh the detection-driven views; leave lightning/satellite
+            # overlays (independent of detection params) untouched.
+            self.volumes.show_results(rebuilt)
+            last = rebuilt[-1]
+            self.map.show_result(last.warning, last.volume, last.cells)
+            self._refresh_tracks()
+            self.statusBar().showMessage(
+                f"Reprocessed {last.warning.event} — {len(rebuilt)} volume(s) "
+                f"(detection hash {self.params.settings_hash})"
             )
 
         # --- search / results --------------------------------------------
@@ -349,6 +412,7 @@ def _build_window(persist: bool):
 
         def on_select(self, warning) -> None:
             self._selected_id = warning.id
+            self._selected_warning = warning
             self.volumes.set_warning(warning)
             self.map.show_warning(warning)
             # Arm the lightning + satellite windows for this warning and drop any
@@ -357,8 +421,11 @@ def _build_window(persist: bool):
             self._reset_lightning()
             self.satellite_window.set_warning(warning)
             self._reset_satellite()
+            self.stormtrack_window.set_warning(warning)
+            self.map.clear_stormtrack()
             for res in self._results.get(warning.id, []):
                 self.volumes.add_result(res)
+            self._refresh_tracks()
             self.statusBar().showMessage(f"Selected {warning.event} ETN {warning.etn:04d}")
 
         def on_downloaded_select(self, warning) -> None:
@@ -384,6 +451,7 @@ def _build_window(persist: bool):
                 return
             site = self.resolver.for_polygon(warning.polygon)
             self._selected_id = warning.id
+            self._selected_warning = warning
             self._results[warning.id] = []
             self.volumes.set_warning(warning)
             self.map.show_warning(warning)
@@ -391,6 +459,8 @@ def _build_window(persist: bool):
             self._reset_lightning()
             self.satellite_window.set_warning(warning)
             self._reset_satellite()
+            self.stormtrack_window.set_warning(warning)
+            self.map.clear_stormtrack()
 
             log.info("download.start", warning=warning.id, event_name=warning.event,
                      site=site.icao, issued=warning.issued.isoformat(),
@@ -500,6 +570,7 @@ def _build_window(persist: bool):
                 self.map.show_result(res.warning, res.volume, res.cells)
                 self._show_lightning_for(res.volume)
                 self._show_satellite_for(res.volume)
+                self._refresh_tracks()
             self.statusBar().showMessage(
                 f"{res.warning.event}  {res.volume.valid_time:%H%MZ}  "
                 f"{res.index}/{res.total}  {len(res.cells)} cell(s)"
@@ -520,6 +591,25 @@ def _build_window(persist: bool):
                 f"Storm id {c.cell_id}  track {c.track_id}  "
                 f"{c.max_dbz:.1f} dBZ  depth {c.depth_km:.1f} km"
             )
+
+        # --- storm tracks -------------------------------------------------
+
+        def _refresh_tracks(self) -> None:
+            """Rebuild the Storm Track listing for the selected warning.
+
+            Cheap and pure (:func:`build_tracks`), so it runs on every new
+            volume and after each satellite association; the window preserves the
+            user's current track selection across the rebuild.
+            """
+            from .tracks import build_tracks
+
+            results = self._results.get(self._selected_id, [])
+            self.stormtrack_window.set_tracks(build_tracks(results))
+
+        def _on_track_selected(self, track) -> None:
+            """A track was clicked in the Storm Track window — draw it on the map."""
+            if track is not None:
+                self.map.show_storm_track(track)
 
         def _on_model_frame(self, volume, cell, cells) -> None:
             """3D pane produced a frame (selection or playback) — sync the map."""
@@ -773,9 +863,11 @@ def _build_window(persist: bool):
                 )
                 associate_radar(cells, radar_res.cells, self._sat_tracker.params)
                 # The matched volume's storms now carry cloud-top temp + OT —
-                # refresh its row so the volume listing shows them.
+                # refresh its row so the volume listing shows them, and rebuild
+                # the track charts so the cloud-top/OT series pick them up.
                 if warning.id == self._selected_id:
                     self.volumes.add_result(radar_res)
+                    self._refresh_tracks()
 
             if getattr(self, "_sat_persistence", None) is not None:
                 try:
@@ -927,7 +1019,7 @@ def run_smoke(args: argparse.Namespace) -> int:
     from PySide6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication(sys.argv)
-    window = _build_window(persist=False)
+    window = _build_window(persist=False, use_local_settings=False)
     # No window.show() — VTK renders to its own GL window; the panes are fully
     # instantiated either way.
 
@@ -979,6 +1071,16 @@ def run_smoke(args: argparse.Namespace) -> int:
         window._on_scene(last_warning, scene, cells, 1, 1)
         assert window._sat_results, "satellite scene did not register"
 
+    # Storm Track window: rebuild its track listing from the processed volumes
+    # and drive a selection through to the map, proving the wiring end-to-end.
+    if last_warning is not None:
+        window.on_select(last_warning)  # arms + refreshes the track listing
+        if window.stormtrack_window.model.rowCount():
+            window.stormtrack_window.list.setCurrentIndex(
+                window.stormtrack_window.model.index(0, 0)
+            )
+            assert window.stormtrack_window.charts is not None
+
     # Instantiate the modal dialogs to prove they build (8B).
     settings_dlg = SettingsDialog(window.dsn, window.settings_path, window)
     download_dlg = DownloadDialog("KFWS  Tornado Warning", total=9, parent=window)
@@ -988,8 +1090,9 @@ def run_smoke(args: argparse.Namespace) -> int:
 
     app.processEvents()
     print(
-        "smoke: panes (search, volumes, map, model, satellite) + settings/download "
-        "dialogs instantiated, fixture + cloud-top scene rendered — OK"
+        "smoke: panes (search, volumes, map, model, satellite, storm-track) + "
+        "settings/download dialogs instantiated, fixture + cloud-top scene "
+        "rendered, storm tracks built — OK"
     )
     # The real smoke work is done. Reap the private Xvfb (if any) and hard-exit
     # 0: VTK/GL stacks can SIGABRT during interpreter teardown (a cosmetic
