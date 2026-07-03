@@ -19,6 +19,7 @@ GROUP_DISPLAY = "Display"
 GROUP_VIEWER = "Viewer (3D)"
 GROUP_LIGHTNING = "Lightning"
 GROUP_SATELLITE = "Satellite (GOES ABI)"
+GROUP_HRRR = "Environment (HRRR)"
 
 
 @dataclass(frozen=True)
@@ -154,7 +155,7 @@ REGISTRY: tuple[SettingSpec, ...] = (
     SettingSpec("sat_auto_fetch", "Auto-fetch after download", GROUP_SATELLITE,
                 "bool", False, "Automatically run the GOES cloud-top pull for a "
                 "warning once its radar download finishes (annotates each volume's "
-                "storms with cloud-top temp + OT). Off by default."),
+                "storms with cloud-top temp). Off by default."),
     SettingSpec("sat_cold_bt_k", "Cold-cloud threshold (K)", GROUP_SATELLITE,
                 "float", 235.0, "Brightness temperature at/below which a pixel "
                 "is cold cloud and seeds a cloud-top object.", min=180.0, max=300.0),
@@ -167,12 +168,6 @@ REGISTRY: tuple[SettingSpec, ...] = (
     SettingSpec("sat_anvil_area_km2", "Anviled-out area (km^2)", GROUP_SATELLITE,
                 "float", 2500.0, "Cold-canopy area at/above which a cell is "
                 "flagged 'anviled out'.", min=0.0, max=100000.0),
-    SettingSpec("sat_ot_delta_k", "OT minus anvil depth (K)", GROUP_SATELLITE,
-                "float", 6.5, "Coldest pixel must be this much colder than the "
-                "surrounding anvil to flag an overshooting top.", min=0.0, max=40.0),
-    SettingSpec("sat_ot_max_bt_k", "OT max BT (K)", GROUP_SATELLITE, "float",
-                205.0, "Coldest pixel must be at/below this to flag an "
-                "overshooting top.", min=170.0, max=260.0),
     SettingSpec("sat_track_max_km", "Cloud-top track max (km)", GROUP_SATELLITE,
                 "float", 20.0, "Max displacement between scenes to continue a "
                 "cloud-top track.", min=0.0, max=200.0),
@@ -188,6 +183,22 @@ REGISTRY: tuple[SettingSpec, ...] = (
     SettingSpec("sat_target_res_deg", "Reproject resolution (deg)", GROUP_SATELLITE,
                 "float", 0.02, "Regular lon/lat raster spacing for the "
                 "reprojected brightness temperature.", min=0.005, max=0.1),
+    # -- Environment (HRRR freezing level + vault detection) ---------------
+    SettingSpec("hrrr_vault_dbz", "Vault reflectivity (dBZ)", GROUP_HRRR, "float",
+                50.0, "Reflectivity defining the storm's echo tower / vault "
+                "core measured against the 0°C level.", min=0.0, max=80.0),
+    SettingSpec("hrrr_vault_min_depth_km", "Vault min depth above 0°C (km)",
+                GROUP_HRRR, "float", 4.5, "The vault-reflectivity tower must "
+                "extend at least this far above the HRRR 0°C level to flag the "
+                "cell's overshooting top (~4.5 km is the classic severe-hail "
+                "depth).", min=0.0, max=15.0),
+    SettingSpec("hrrr_bbox_pad_deg", "Bounding-box padding (deg)", GROUP_HRRR,
+                "float", 0.5, "Degrees of lat/lon padding around the radar "
+                "volume footprint for the HRRR crop.", min=0.0, max=5.0),
+    SettingSpec("hrrr_target_res_deg", "Resample resolution (deg)", GROUP_HRRR,
+                "float", 0.03, "Regular lon/lat raster spacing for the "
+                "resampled freezing-level grid (native HRRR is ~3 km).",
+                min=0.01, max=0.25),
 )
 
 REGISTRY_BY_KEY: dict[str, SettingSpec] = {s.key: s for s in REGISTRY}
@@ -205,8 +216,13 @@ DETECTION_KEYS: tuple[str, ...] = (
 # detection knobs, so they are excluded from the hash.
 CLOUDTOP_KEYS: tuple[str, ...] = (
     "sat_cold_bt_k", "sat_min_area_km2", "sat_anvil_bt_k", "sat_anvil_area_km2",
-    "sat_ot_delta_k", "sat_ot_max_bt_k", "sat_track_max_km", "sat_track_miss_max",
-    "sat_assoc_max_km",
+    "sat_track_max_km", "sat_track_miss_max", "sat_assoc_max_km",
+)
+
+# Vault (HRRR freezing-level) detection knob set (provenance). Crop/resample
+# keys are ingest choices, not detection knobs, so they are excluded.
+VAULT_KEYS: tuple[str, ...] = (
+    "hrrr_vault_dbz", "hrrr_vault_min_depth_km",
 )
 
 

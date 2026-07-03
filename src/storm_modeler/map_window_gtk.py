@@ -89,13 +89,13 @@ function setSatellite(url,b){ if(satLayer)map.removeLayer(satLayer);
 function setSatelliteOpacity(v){ satOpacity=v; if(satLayer)satLayer.setOpacity(v);}
 function clearSatellite(){ if(satLayer)map.removeLayer(satLayer); satLayer=null;
   if(cloudtopLayer)map.removeLayer(cloudtopLayer); cloudtopLayer=null;}
-// Cloud-top cells: anvil/footprint polygons + coldest-pixel markers (overshooting
-// tops magenta + larger, cores cyan). Popups carry BT and storm tilt.
+// Cloud-top cells: anvil/footprint polygons + coldest-pixel markers (cyan).
+// Popups carry BT and storm tilt.
 function setCloudtops(gj){ if(cloudtopLayer)map.removeLayer(cloudtopLayer);
   cloudtopLayer=L.geoJSON(gj,{
-    pointToLayer:function(f,ll){var ot=f.properties.kind==='ot';
-      return L.circleMarker(ll,{radius:ot?7:4,
-        color:ot?'#f0f':'#0ff',weight:2,fillOpacity:0.55});},
+    pointToLayer:function(f,ll){
+      return L.circleMarker(ll,{radius:4,
+        color:'#0ff',weight:2,fillOpacity:0.55});},
     style:function(f){return {color:f.properties.kind==='anvil'?'#88f':'#0cf',
       weight:1.5,fill:false};},
     onEachFeature:function(f,l){var p=f.properties;var s='BT '+p.min_bt_k+' K';

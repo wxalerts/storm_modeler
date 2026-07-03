@@ -1,43 +1,40 @@
-"""Satellite window — GOES ABI cloud-top analysis for the selected warning.
+"""Environment window — HRRR 0 °C freezing level for the selected warning.
 
-A small top-level control window (like the Lightning, 3D View, and Logs
-windows). It owns no map of its own: pressing **Fetch** asks the app to pull ABI
-Band-13 scenes for the current warning's data window, run cloud-top detection,
-and layer the brightness-temperature image + cloud-top/anvil markers onto the
-existing Leaflet map. **Clear** removes the overlay.
+A small top-level control window (like the Lightning and Satellite windows).
+It owns no map of its own: pressing **Fetch** asks the app to pull the hourly
+HRRR freezing-level analyses for the current warning's data window and run
+vault detection — measuring how far each radar cell's high-reflectivity tower
+extends above the 0 °C level and deriving its overshooting-top flag (the GOES
+ABI OT flag was removed as unreliable; this is its replacement). **Clear**
+drops the grids and the per-cell vault annotations.
 
 The window stays deliberately dumb — it emits the current :class:`Warning` and
-lets the app compute the time window, bbox, and satellite from settings.
+lets the app compute the time window, bbox, and parameters from settings.
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QPushButton,
-    QSlider,
     QVBoxLayout,
     QWidget,
 )
 
 from ..models import Warning
 
-#: Default BT-overlay opacity (percent) — matches the map's initial value.
-_DEFAULT_OPACITY_PCT = 55
 
-
-class SatelliteWindow(QMainWindow):
+class HRRRWindow(QMainWindow):
     fetch_requested = Signal(object)  # Warning
     clear_requested = Signal()
-    opacity_changed = Signal(float)  # BT-overlay opacity, 0.0–1.0
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Satellite")
-        self.resize(380, 280)
+        self.setWindowTitle("Environment (HRRR)")
+        self.resize(380, 240)
         self._warning: Warning | None = None
 
         central = QWidget()
@@ -51,9 +48,11 @@ class SatelliteWindow(QMainWindow):
         self.window_label.setStyleSheet("color: #888;")
         self.count_label = QLabel("")
         self.count_label.setStyleSheet("font-weight: bold;")
+        self.level_label = QLabel("")
         self.hint_label = QLabel(
-            "Tip: download radar first so cloud-top tilt can be measured "
-            "against the radar core."
+            "Tip: download radar first — the 0°C level feeds vault detection, "
+            "which flags a storm's overshooting top when its tower core "
+            "punches deep above the freezing level."
         )
         self.hint_label.setWordWrap(True)
         self.hint_label.setStyleSheet("color: #888; font-size: 11px;")
@@ -62,7 +61,7 @@ class SatelliteWindow(QMainWindow):
         self.status_label.setStyleSheet("color: #888;")
 
         buttons = QHBoxLayout()
-        self.fetch_btn = QPushButton("Fetch cloud tops")
+        self.fetch_btn = QPushButton("Fetch freezing level")
         self.fetch_btn.setEnabled(False)
         self.fetch_btn.clicked.connect(self._on_fetch)
         self.clear_btn = QPushButton("Clear")
@@ -70,22 +69,11 @@ class SatelliteWindow(QMainWindow):
         buttons.addWidget(self.fetch_btn)
         buttons.addWidget(self.clear_btn)
 
-        # BT-overlay opacity control (how much of the satellite layer shows on
-        # the Leaflet map).
-        opacity_row = QHBoxLayout()
-        self.opacity_caption = QLabel(f"Overlay opacity  {_DEFAULT_OPACITY_PCT}%")
-        self.opacity_slider = QSlider(Qt.Horizontal)
-        self.opacity_slider.setRange(0, 100)
-        self.opacity_slider.setValue(_DEFAULT_OPACITY_PCT)
-        self.opacity_slider.valueChanged.connect(self._on_opacity)
-        opacity_row.addWidget(self.opacity_caption)
-        opacity_row.addWidget(self.opacity_slider, 1)
-
         layout.addWidget(self.event_label)
         layout.addWidget(self.window_label)
         layout.addLayout(buttons)
-        layout.addLayout(opacity_row)
         layout.addWidget(self.count_label)
+        layout.addWidget(self.level_label)
         layout.addWidget(self.status_label)
         layout.addWidget(self.hint_label)
         layout.addStretch(1)
@@ -101,6 +89,7 @@ class SatelliteWindow(QMainWindow):
             f"{warning.issued:%Y-%m-%d %H:%MZ} → {warning.expires:%H:%MZ}"
         )
         self.count_label.setText("")
+        self.level_label.setText("")
         self.status_label.setText("")
         self.fetch_btn.setEnabled(True)
 
@@ -110,18 +99,18 @@ class SatelliteWindow(QMainWindow):
     def set_status(self, msg: str) -> None:
         self.status_label.setText(msg)
 
-    def set_count(self, n_scenes: int, n_cells: int) -> None:
+    def set_count(self, n_grids: int, n_vaults: int) -> None:
         self.count_label.setText(
-            f"{n_scenes} scene(s) · {n_cells} cloud-top cell(s)"
+            f"{n_grids} analysis hour(s) · {n_vaults} cell(s) with a vault/OT"
         )
 
-    def _on_opacity(self, pct: int) -> None:
-        self.opacity_caption.setText(f"Overlay opacity  {pct}%")
-        self.opacity_changed.emit(pct / 100.0)
+    def set_level(self, text: str) -> None:
+        """Show the freezing level for the moment on the map (e.g. '4.2 km MSL')."""
+        self.level_label.setText(text)
 
     def _on_fetch(self) -> None:
         if self._warning is not None:
             self.set_busy(True)
             self.count_label.setText("")
-            self.status_label.setText("Fetching GOES ABI cloud tops…")
+            self.status_label.setText("Fetching HRRR 0°C freezing level…")
             self.fetch_requested.emit(self._warning)

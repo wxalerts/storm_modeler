@@ -233,6 +233,82 @@ class GriddedVolume:
 
 
 @dataclass
+class FreezingLevelGrid:
+    """One HRRR analysis of the 0 °C isotherm height on a lon/lat raster.
+
+    Same raster convention as :class:`SatelliteScene`: ``heights_m[j, i]`` is
+    the freezing-level height (metres **MSL**, the HRRR ``HGT : 0C isotherm``
+    field) at ``lons[i]`` / ``lats[j]``, with ``lats`` descending (row 0 =
+    north). Produced by :class:`storm_modeler.data.hrrr.HRRRSource` (the Lambert
+    conformal → lon/lat resampling happens once, on the worker, without pyproj)
+    or read from a fixture ``*.npz``. Vault detection samples it per storm cell
+    via :meth:`height_at`.
+    """
+
+    model: str  # e.g. "HRRR"
+    valid_time: datetime
+    heights_m: np.ndarray  # (nlat, nlon) 0C isotherm height, metres MSL, NaN off-grid
+    lons: np.ndarray  # (nlon,) ascending
+    lats: np.ndarray  # (nlat,) descending (row 0 = north)
+    bbox: tuple[float, float, float, float]  # (lon_min, lat_min, lon_max, lat_max)
+
+    def __post_init__(self) -> None:
+        self.valid_time = _parse_dt(self.valid_time)
+        self.heights_m = np.asarray(self.heights_m, dtype=np.float32)
+        self.lons = np.asarray(self.lons, dtype=np.float64)
+        self.lats = np.asarray(self.lats, dtype=np.float64)
+        self.bbox = tuple(float(v) for v in self.bbox)  # type: ignore[assignment]
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.heights_m.shape
+
+    def height_at(self, lon: float, lat: float) -> float:
+        """Freezing-level height (m MSL) at a point — nearest-pixel sample.
+
+        The 0 °C surface varies over tens of km, far coarser than the raster,
+        so nearest-neighbour is plenty. Returns NaN outside the raster.
+        """
+        if (not self.lons.size or not self.lats.size
+                or not (self.lons[0] <= lon <= self.lons[-1])
+                or not (self.lats[-1] <= lat <= self.lats[0])):
+            return float("nan")
+        i = int(np.argmin(np.abs(self.lons - lon)))
+        j = int(np.argmin(np.abs(self.lats - lat)))
+        return float(self.heights_m[j, i])
+
+    def mean_height_m(self) -> float:
+        """Mean freezing level over the raster (NaN if fully empty)."""
+        return float(np.nanmean(self.heights_m)) if np.isfinite(self.heights_m).any() else float("nan")
+
+    # --- (de)serialisation for fixtures / cache ---------------------------
+
+    def save_npz(self, path: str | Path) -> None:
+        np.savez_compressed(
+            path,
+            model=self.model,
+            valid_time=self.valid_time.isoformat(),
+            heights_m=self.heights_m,
+            lons=self.lons,
+            lats=self.lats,
+            bbox=np.asarray(self.bbox, dtype=np.float64),
+        )
+
+    @classmethod
+    def load_npz(cls, path: str | Path) -> "FreezingLevelGrid":
+        d = np.load(path, allow_pickle=False)
+        bbox = tuple(float(v) for v in d["bbox"])
+        return cls(
+            model=str(d["model"]),
+            valid_time=str(d["valid_time"]),
+            heights_m=d["heights_m"],
+            lons=d["lons"],
+            lats=d["lats"],
+            bbox=bbox,  # type: ignore[arg-type]
+        )
+
+
+@dataclass
 class SatelliteScene:
     """One GOES ABI Band-13 brightness-temperature scene on a lon/lat raster.
 

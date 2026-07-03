@@ -33,9 +33,17 @@ class StormCell:
     envelope: Polygon  # convex-hull footprint in lon/lat
     track_id: int = -1  # assigned by the tracker; -1 until tracked
     # GOES ABI cloud-top annotation, filled by ``cloudtop.associate_radar`` once
-    # a satellite scene is matched to this cell (None/False until then).
+    # a satellite scene is matched to this cell (None until then).
     cloud_top_c: float | None = None  # cloud-top temperature, deg C
-    overshooting_top: bool = False  # the matched cloud top overshoots its anvil
+    # HRRR vault annotation, filled by ``vault.detect_vault`` once a
+    # freezing-level grid is matched to this cell's volume (None/False until
+    # then). Heights are km MSL. The overshooting-top flag is derived here —
+    # the radar tower punching a set depth above the 0 °C level — not from GOES
+    # (the ABI-based OT flag proved unreliable and was removed).
+    freezing_level_km: float | None = None  # HRRR 0 °C isotherm height
+    vault_top_km: float | None = None  # top of the >=vault_dbz echo tower
+    vault_depth_km: float | None = None  # vault_top_km - freezing_level_km
+    overshooting_top: bool = False  # vault_depth_km >= the configured minimum
 
     def summary(self) -> str:
         return (
@@ -60,6 +68,9 @@ class StormCell:
             "depth_km": self.depth_km,
             "n_levels": self.n_levels,
             "cloud_top_c": self.cloud_top_c,
+            "freezing_level_km": self.freezing_level_km,
+            "vault_top_km": self.vault_top_km,
+            "vault_depth_km": self.vault_depth_km,
             "overshooting_top": self.overshooting_top,
             "envelope": mapping(self.envelope),
         }

@@ -18,7 +18,7 @@ from typing import Any
 
 from pathlib import Path
 
-from .registry import CLOUDTOP_KEYS, DETECTION_KEYS, defaults
+from .registry import CLOUDTOP_KEYS, DETECTION_KEYS, VAULT_KEYS, defaults
 from .store import open_store
 
 
@@ -63,8 +63,6 @@ class CloudTopParams:
     min_area_km2: float = 25.0
     anvil_bt_k: float = 220.0
     anvil_area_km2: float = 2500.0
-    ot_delta_k: float = 6.5
-    ot_max_bt_k: float = 205.0
     track_max_km: float = 20.0
     track_miss_max: int = 2
     assoc_max_km: float = 15.0
@@ -79,6 +77,29 @@ class CloudTopParams:
     def from_dict(cls, d: dict[str, Any]) -> "CloudTopParams":
         # registry key "sat_cold_bt_k" → field "cold_bt_k", etc.
         return cls(**{k[len("sat_"):]: d[k] for k in CLOUDTOP_KEYS if k in d})
+
+
+@dataclass(frozen=True)
+class VaultParams:
+    """The vault (HRRR freezing-level) knob set. Passed to ``vault.detect_vault``.
+
+    Field names drop the ``hrrr_`` prefix the registry keys carry;
+    ``from_dict`` maps the resolved ``hrrr_vault_*`` settings onto them.
+    """
+
+    vault_dbz: float = 50.0
+    vault_min_depth_km: float = 4.5
+
+    @property
+    def settings_hash(self) -> str:
+        """Stable short digest of the knob set (provenance)."""
+        payload = json.dumps(asdict(self), sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "VaultParams":
+        # registry key "hrrr_vault_dbz" → field "vault_dbz", etc.
+        return cls(**{k[len("hrrr_"):]: d[k] for k in VAULT_KEYS if k in d})
 
 
 @dataclass(frozen=True)
@@ -127,6 +148,20 @@ class ResolvedSettings:
     @property
     def sat_target_res_deg(self) -> float:
         return float(self.values.get("sat_target_res_deg", 0.02))
+
+    # -- Environment (HRRR freezing level / vault) projections -------------
+
+    @property
+    def vault(self) -> VaultParams:
+        return VaultParams.from_dict(self.values)
+
+    @property
+    def hrrr_bbox_pad_deg(self) -> float:
+        return float(self.values.get("hrrr_bbox_pad_deg", 0.5))
+
+    @property
+    def hrrr_target_res_deg(self) -> float:
+        return float(self.values.get("hrrr_target_res_deg", 0.03))
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.values.get(key, default)

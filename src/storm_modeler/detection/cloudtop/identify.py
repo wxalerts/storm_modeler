@@ -7,10 +7,11 @@ location is an index lookup). The algorithm mirrors SCIT's structure
 metrics → admission gate → deterministic sort.
 
 Cold cloud tops (low brightness temperature) mark deep convection. Each cold
-object yields its coldest pixel (the overshooting-top candidate), a
-BT-weighted centroid, area, and two flags: ``anviled_out`` for a broad cold
-canopy, and ``overshooting_top`` when the coldest pixel pokes a set depth
-colder than the surrounding anvil background.
+object yields its coldest pixel, a BT-weighted centroid, area, and an
+``anviled_out`` flag for a broad cold canopy. (An ABI-based overshooting-top
+flag used to be derived here from anvil depth; it proved unreliable and was
+removed — the OT flag now comes from radar vault detection against the HRRR
+freezing level, see ``detection.vault``.)
 """
 
 from __future__ import annotations
@@ -23,11 +24,6 @@ from ...models import SatelliteScene
 from ...settings.resolver import CloudTopParams
 from .types import CloudTopCell
 
-#: Annulus (km) around the coldest pixel used to estimate the anvil background
-#: brightness temperature for the overshooting-top depth test.
-_OT_INNER_KM = 5.0
-_OT_OUTER_KM = 15.0
-
 #: Warm reference (K) for the BT-weighted centroid: colder pixels weigh more.
 _WARM_REF_K = 300.0
 
@@ -39,29 +35,6 @@ def _envelope(lons: np.ndarray, lats: np.ndarray, ys: np.ndarray, xs: np.ndarray
     if isinstance(hull, Polygon):
         return hull
     return hull.buffer(0.01)
-
-
-def _ot_depth(
-    bt: np.ndarray, yc: int, xc: int, dlat_km: float, dlon_km: float, anvil_bt_k: float
-) -> float:
-    """Anvil-background mean (in the annulus) minus the coldest pixel.
-
-    The background is the mean of finite anvil pixels (``bt <= anvil_bt_k``) in a
-    ring ``[_OT_INNER_KM, _OT_OUTER_KM]`` around the coldest pixel. Returns 0 when
-    no anvil pixels surround the core (nothing to overshoot).
-    """
-    ny, nx = bt.shape
-    ry = max(1, int(round(_OT_OUTER_KM / max(dlat_km, 1e-6))))
-    rx = max(1, int(round(_OT_OUTER_KM / max(dlon_km, 1e-6))))
-    y0, y1 = max(0, yc - ry), min(ny, yc + ry + 1)
-    x0, x1 = max(0, xc - rx), min(nx, xc + rx + 1)
-    win = bt[y0:y1, x0:x1]
-    yy, xx = np.mgrid[y0:y1, x0:x1]
-    dist = np.hypot((yy - yc) * dlat_km, (xx - xc) * dlon_km)
-    ring = (dist >= _OT_INNER_KM) & (dist <= _OT_OUTER_KM) & np.isfinite(win) & (win <= anvil_bt_k)
-    if not ring.any():
-        return 0.0
-    return float(np.mean(win[ring]) - bt[yc, xc])
 
 
 def identify(
@@ -110,9 +83,6 @@ def identify(
         anvil_frac = float(np.mean(vals <= params.anvil_bt_k))
         anviled_out = area_km2 >= params.anvil_area_km2 or anvil_frac >= 0.5
 
-        ot_depth = _ot_depth(bt, yc, xc, dlat_km, dlon_km, params.anvil_bt_k)
-        overshooting_top = min_bt <= params.ot_max_bt_k and ot_depth >= params.ot_delta_k
-
         candidates.append(
             CloudTopCell(
                 cell_id=-1,
@@ -126,8 +96,6 @@ def identify(
                 mean_bt_k=mean_bt,
                 area_km2=area_km2,
                 anviled_out=anviled_out,
-                overshooting_top=overshooting_top,
-                ot_depth_k=ot_depth,
                 envelope=_envelope(lons, lats, ys, xs),
             )
         )

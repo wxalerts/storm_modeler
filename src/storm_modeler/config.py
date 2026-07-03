@@ -43,6 +43,11 @@ LIGHTNING_MODULES = ("boto3", "netCDF4")
 #: provides geolocation helpers. All ship in the ``live`` extra.
 SATELLITE_MODULES = ("boto3", "xarray", "goes2go")
 
+#: Modules the HRRR freezing-level pull imports lazily (see ``data/hrrr.py``).
+#: ``boto3`` does the idx + byte-range S3 reads; ``pygrib`` decodes the single
+#: GRIB2 message. Both ship in the ``live`` extra.
+HRRR_MODULES = ("boto3", "pygrib")
+
 #: Hint shown when a live module is missing.
 LIVE_EXTRA_HINT = "run: uv sync --extra live"
 

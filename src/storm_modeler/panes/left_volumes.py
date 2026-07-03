@@ -26,14 +26,18 @@ def _z(dt: datetime) -> str:
 
 
 def _cell_label(c: StormCell) -> str:
-    """One-line storm summary, with cloud-top temp + OT flag when available.
+    """One-line storm summary, with cloud-top temp and vault/OT when available.
 
-    e.g. ``id 1  63.0 dBZ  depth 16.5 km  -20°C CT  OT`` — the CT/OT segments
-    appear only once a GOES ABI scene has been associated to the cell.
+    e.g. ``id 1  63.0 dBZ  depth 16.5 km  -20°C CT  vault +5.2 km  OT`` — the
+    CT segment appears once a GOES ABI scene has been associated to the cell;
+    the vault/OT segments once an HRRR freezing-level grid has (vault depth is
+    how far the tower core extends above the 0°C level).
     """
     parts = [f"id {c.cell_id}", f"{c.max_dbz:.1f} dBZ", f"depth {c.depth_km:.1f} km"]
     if c.cloud_top_c is not None:
         parts.append(f"{c.cloud_top_c:.0f}°C CT")
+    if c.vault_depth_km is not None:
+        parts.append(f"vault {c.vault_depth_km:+.1f} km")
         if c.overshooting_top:
             parts.append("OT")
     return "  ".join(parts)

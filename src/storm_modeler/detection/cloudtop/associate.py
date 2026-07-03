@@ -7,8 +7,10 @@ to the cloud top that sits **over** it — the cloud top whose (parallax-correct
 anvil footprint contains the radar core, coldest top winning when several
 overlap, with a nearest-within-``assoc_max_km`` fallback. The matched radar
 :class:`StormCell` is annotated with ``cloud_top_c`` (coldest-pixel temperature,
-deg C) and ``overshooting_top`` for the volume listing; the cloud top records the
-residual core-to-top offset as storm tilt (``tilt_km`` / ``tilt_bearing_deg``).
+deg C) for the volume listing; the cloud top records the residual core-to-top
+offset as storm tilt (``tilt_km`` / ``tilt_bearing_deg``). The radar cell's
+``overshooting_top`` flag is NOT touched here — it is owned by vault detection
+(``detection.vault``, radar tower vs the HRRR 0 °C level).
 
 A single anvil may overlie several cells, so cloud tops are **not** claimed
 exclusively. Pure given the two cell lists; the caller pairs a scene to the radar
@@ -98,7 +100,6 @@ def associate_radar(
                 continue
 
         r.cloud_top_c = best.min_bt_k - 273.15
-        r.overshooting_top = False
 
         # Record storm tilt on the cloud top (closest core wins when shared).
         # Track "claimed" via owner_of, not radar_track_id — untracked cells set
@@ -111,12 +112,4 @@ def associate_radar(
                 r.seed_lon, r.seed_lat, best.cold_lon, best.cold_lat
             )
             owner_of[id(best)] = r
-    # Attribute each overshoot to the single radar core nearest its dome.
-    # owner_of holds the closest sharer (set by the tilt block), so the OT lands
-    # on the column under the dome — not every cell under the anvil.
-    for c in cloudtop_cells:
-        if c.overshooting_top:
-            owner = owner_of.get(id(c))
-            if owner is not None:
-                owner.overshooting_top = True
     return cloudtop_cells

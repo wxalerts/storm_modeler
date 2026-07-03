@@ -21,7 +21,7 @@ import structlog
 
 from .config import CACHE_DIR
 from .data.volumes import FixtureVolumeSource
-from .models import GriddedVolume, SatelliteScene, Warning
+from .models import FreezingLevelGrid, GriddedVolume, SatelliteScene, Warning
 
 log = structlog.get_logger(__name__)
 
@@ -74,6 +74,17 @@ class DownloadStore:
         name = f"scene_{scene.valid_time:%Y%m%dT%H%M%SZ}.npz"
         scene.save_npz(sdir / name)
 
+    def save_flevel(self, warning_id: str, grid: FreezingLevelGrid) -> None:
+        """Persist one HRRR freezing-level grid as ``hrrr/fl_<valid_time>.npz``.
+
+        Parallel to :meth:`save_scene`; a :class:`~storm_modeler.data.hrrr
+        .FixtureFreezingLevelSource` over the ``hrrr/`` dir replays them offline.
+        """
+        hdir = self.dir(warning_id) / "hrrr"
+        hdir.mkdir(parents=True, exist_ok=True)
+        name = f"fl_{grid.valid_time:%Y%m%dT%H%M%SZ}.npz"
+        grid.save_npz(hdir / name)
+
     # --- reads ------------------------------------------------------------
 
     def volume_source(self, warning_id: str) -> FixtureVolumeSource:
@@ -91,6 +102,15 @@ class DownloadStore:
 
     def scene_count(self, warning_id: str) -> int:
         return len(list((self.dir(warning_id) / "scenes").glob("*.npz")))
+
+    def flevel_source(self, warning_id: str):
+        """A :class:`FixtureFreezingLevelSource` replaying this warning's grids."""
+        from .data.hrrr import FixtureFreezingLevelSource
+
+        return FixtureFreezingLevelSource(self.dir(warning_id))
+
+    def flevel_count(self, warning_id: str) -> int:
+        return len(list((self.dir(warning_id) / "hrrr").glob("*.npz")))
 
     def warnings(self) -> list[Warning]:
         """Every persisted warning, oldest→newest (skips unreadable dirs)."""

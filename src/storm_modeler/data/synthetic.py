@@ -20,7 +20,7 @@ import numpy as np
 from pyproj import Transformer
 
 from ..config import DEFAULT_GRID, GridConfig
-from ..models import GriddedVolume, SatelliteScene
+from ..models import FreezingLevelGrid, GriddedVolume, SatelliteScene
 
 # Default fixture grid spacing (km). Matches the registry grid_h_km / grid_v_km
 # defaults; kept here so synthetic volumes need no settings store.
@@ -183,6 +183,29 @@ def make_cold_scene(
         lons=lons,
         lats=lats,
         bbox=bbox,
+    )
+
+
+def make_freezing_grid(
+    valid_time: datetime | str,
+    bbox: tuple[float, float, float, float],
+    level_m: float = 4000.0,
+    res_deg: float = 0.03,
+    model: str = "HRRR",
+) -> FreezingLevelGrid:
+    """A flat synthetic 0 °C freezing-level grid at ``level_m`` (metres MSL).
+
+    Closed-form (constant field), so a given call yields byte-identical grids —
+    the determinism mandate. The raster runs north→south (row 0 = north) to
+    match :class:`FreezingLevelGrid`.
+    """
+    lon_min, lat_min, lon_max, lat_max = bbox
+    lons = np.arange(lon_min, lon_max + res_deg / 2, res_deg, dtype=np.float64)
+    lats = np.arange(lat_max, lat_min - res_deg / 2, -res_deg, dtype=np.float64)
+    heights = np.full((lats.size, lons.size), float(level_m), dtype=np.float32)
+    return FreezingLevelGrid(
+        model=model, valid_time=valid_time,
+        heights_m=heights, lons=lons, lats=lats, bbox=bbox,
     )
 
 

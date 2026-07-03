@@ -29,11 +29,13 @@ from .detection.cloudtop import (
     associate_radar,
     run as cloudtop_run,
 )
-from .models import GriddedVolume, SatelliteScene, Warning
+from .detection.vault import detect_vault
+from .models import FreezingLevelGrid, GriddedVolume, SatelliteScene, Warning
 from .settings.resolver import (
     CloudTopParams,
     DetectionParams,
     ResolvedSettings,
+    VaultParams,
     resolve,
 )
 
@@ -206,6 +208,31 @@ def process_warning_satellite(
             on_progress(i, total, scene)
         if on_result is not None:
             on_result(res)
+    return results
+
+
+def annotate_vault_results(
+    results: list[VolumeResult],
+    grids: list[FreezingLevelGrid],
+    params: VaultParams | None = None,
+) -> list[VolumeResult]:
+    """Annotate every volume's cells with vault metrics vs the 0 °C level.
+
+    Each volume is paired with the HRRR freezing-level grid nearest in time
+    (the 0 °C surface moves slowly, so the hourly analyses bracket every radar
+    volume) and its cells are annotated in place by
+    :func:`~storm_modeler.detection.vault.detect_vault` — including the derived
+    ``overshooting_top`` flag. Pure given its inputs; a no-op without grids.
+    """
+    if not grids:
+        return results
+    params = params or VaultParams()
+    for res in results:
+        grid = min(
+            grids,
+            key=lambda g: abs((g.valid_time - res.volume.valid_time).total_seconds()),
+        )
+        detect_vault(res.volume, res.cells, grid, res.site.elevation_m, params)
     return results
 
 

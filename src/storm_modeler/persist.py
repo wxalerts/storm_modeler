@@ -93,8 +93,6 @@ CREATE TABLE IF NOT EXISTS cloudtop_cells_v2 (
     mean_bt_k      real,
     area_km2       real,
     anviled_out    boolean,
-    overshooting_top boolean,
-    ot_depth_k     real,
     radar_track_id integer,
     tilt_km        real,
     tilt_bearing_deg real,
@@ -267,10 +265,10 @@ class Persistence:
                     INSERT INTO cloudtop_cells_v2
                         (warning_id, event_type, settings_hash, satellite,
                          valid_time, track_id, cell_id, min_bt_k, mean_bt_k,
-                         area_km2, anviled_out, overshooting_top, ot_depth_k,
+                         area_km2, anviled_out,
                          radar_track_id, tilt_km, tilt_bearing_deg,
                          cold, centroid, envelope)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                             ST_GeomFromWKB(%s,4326), ST_GeomFromWKB(%s,4326),
                             ST_GeomFromWKB(%s,4326))
                     ON CONFLICT (warning_id, satellite, valid_time, track_id)
@@ -282,8 +280,6 @@ class Persistence:
                         mean_bt_k=EXCLUDED.mean_bt_k,
                         area_km2=EXCLUDED.area_km2,
                         anviled_out=EXCLUDED.anviled_out,
-                        overshooting_top=EXCLUDED.overshooting_top,
-                        ot_depth_k=EXCLUDED.ot_depth_k,
                         radar_track_id=EXCLUDED.radar_track_id,
                         tilt_km=EXCLUDED.tilt_km,
                         tilt_bearing_deg=EXCLUDED.tilt_bearing_deg,
@@ -294,8 +290,7 @@ class Persistence:
                     (
                         warning_id, event_type, settings_hash, c.satellite,
                         c.valid_time, c.track_id, c.cell_id, c.min_bt_k,
-                        c.mean_bt_k, c.area_km2, c.anviled_out, c.overshooting_top,
-                        c.ot_depth_k, c.radar_track_id,
+                        c.mean_bt_k, c.area_km2, c.anviled_out, c.radar_track_id,
                         None if c.tilt_km != c.tilt_km else c.tilt_km,
                         None if c.tilt_bearing_deg != c.tilt_bearing_deg
                         else c.tilt_bearing_deg,

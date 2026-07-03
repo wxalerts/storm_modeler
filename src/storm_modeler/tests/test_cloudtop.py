@@ -33,17 +33,6 @@ def test_identify_one_cold_object():
     assert c.envelope.is_valid and c.envelope.area > 0
 
 
-def test_overshooting_top_flag_true_and_false():
-    # Sharp cold core well below anvil -> OT.
-    hot = ct.run(_scene(core_bt_k=196.0, anvil_bt_k=216.0))[0]
-    assert hot.overshooting_top is True
-    assert hot.ot_depth_k >= CloudTopParams().ot_delta_k
-
-    # Core barely colder than anvil -> no OT (depth below threshold).
-    flat = ct.run(_scene(core_bt_k=214.0, anvil_bt_k=215.0))[0]
-    assert flat.overshooting_top is False
-
-
 def test_anviled_out_flag():
     big = ct.run(_scene(anvil_radius_km=60.0))[0]
     assert big.anviled_out is True
@@ -87,24 +76,27 @@ def test_radar_association_tilt():
     # Tilt is the residual offset after parallax correction (a few to tens of km).
     assert 0.0 < c.tilt_km < 40.0
     assert np.isfinite(c.tilt_bearing_deg)
-    # The radar cell is annotated with cloud-top temp (deg C) + OT for the listing.
+    # The radar cell is annotated with cloud-top temp (deg C) for the listing.
     assert radar[0].cloud_top_c is not None
     assert abs(radar[0].cloud_top_c - (c.min_bt_k - 273.15)) < 1e-6
-    assert radar[0].overshooting_top == c.overshooting_top
 
-def test_ot_attributed_to_nearest_core_only():
+
+def test_association_never_touches_radar_ot_flag():
+    """The OT flag belongs to vault detection — GOES association must not
+    set OR clear it."""
     cells = ct.run(_scene())
-    assert cells[0].overshooting_top  # scene fixture has an OT
-    near = scit.run(make_storm_volume("KFWS", KFWS.lat, KFWS.lon,
-        "2024-05-25T17:42:00Z", core_lon=cells[0].cold_lon + 0.03,
-        core_lat=cells[0].cold_lat, echo_top_km=12.0))[0]
-    far = scit.run(make_storm_volume("KFWS", KFWS.lat, KFWS.lon,
-        "2024-05-25T17:42:00Z", core_lon=cells[0].cold_lon + 0.20,
-        core_lat=cells[0].cold_lat, echo_top_km=10.0))[0]
-    ct.associate_radar(cells, [near, far], CloudTopParams())
-    assert near.overshooting_top and not far.overshooting_top
-    assert near.cloud_top_c is not None and far.cloud_top_c is not None  # temp still shared
-    
+    radar = scit.run(
+        make_storm_volume(
+            "KFWS", KFWS.lat, KFWS.lon, "2024-05-25T17:42:00Z",
+            core_lon=KFWS.lon + 0.05, core_lat=KFWS.lat, echo_top_km=10.0,
+        )
+    )
+    radar[0].overshooting_top = True  # pretend vault detection already ran
+    ct.associate_radar(cells, radar, CloudTopParams())
+    assert radar[0].overshooting_top is True
+    assert radar[0].cloud_top_c is not None
+
+
 def test_radar_association_skips_distant_cell():
     cells = ct.run(_scene())
     # A radar cell far outside assoc_max_km.

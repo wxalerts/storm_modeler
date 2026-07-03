@@ -76,13 +76,20 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
     from .panes.left_search import LeftSearchPane
     from .panes.left_volumes import LeftVolumesPane
     from .panes.map_client import MapClient
+    from .panes.hrrr_window import HRRRWindow
     from .panes.lightning_window import LightningWindow
     from .panes.logs_window import LogsWindow
     from .panes.model_view import ModelPane
     from .panes.satellite_pane import SatelliteWindow
     from .panes.stormtrack_window import StormTrackWindow
     from .settings.resolver import resolve
-    from .workers import LightningWorker, SatelliteWorker, SearchWorker, WarningWorker
+    from .workers import (
+        HRRRWorker,
+        LightningWorker,
+        SatelliteWorker,
+        SearchWorker,
+        WarningWorker,
+    )
 
     class MainWindow(QMainWindow):
         def __init__(self) -> None:
@@ -120,6 +127,9 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             self._sat_tracker = None
             self._sat_persistence = None
             self._current_sat_time = None  # valid_time of the scene on the map
+            # HRRR freezing-level grids for the selected warning (vault/OT
+            # detection re-runs against them whenever a volume or grid lands).
+            self._hrrr_grids: list = []
             # On-disk cache of downloaded warnings (volumes + metadata) so the
             # "Downloaded" list and its data survive app restarts.
             self.downloads = DownloadStore()
@@ -157,6 +167,9 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             # Satellite window (fetches GOES ABI cloud-top analysis onto the map).
             self.satellite_window = SatelliteWindow()
 
+            # Environment window (fetches the HRRR 0°C level, drives vault/OT).
+            self.hrrr_window = HRRRWindow()
+
             # Storm Track window (lists tracked storms + charts their history).
             self.stormtrack_window = StormTrackWindow()
 
@@ -166,6 +179,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
                 "data": self, "model": self.model_window, "logs": self.logs_window,
                 "lightning": self.lightning_window,
                 "satellite": self.satellite_window,
+                "hrrr": self.hrrr_window,
                 "stormtrack": self.stormtrack_window,
             }
 
@@ -192,6 +206,8 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             self.satellite_window.fetch_requested.connect(self.on_fetch_satellite)
             self.satellite_window.clear_requested.connect(self.map.clear_satellite)
             self.satellite_window.opacity_changed.connect(self.map.set_satellite_opacity)
+            self.hrrr_window.fetch_requested.connect(self.on_fetch_hrrr)
+            self.hrrr_window.clear_requested.connect(self._clear_hrrr)
             self.stormtrack_window.track_selected.connect(self._on_track_selected)
             self.stormtrack_window.clear_requested.connect(self.map.clear_stormtrack)
 
@@ -229,6 +245,8 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
                 lambda: self._raise_window(self.lightning_window))
             win_menu.addAction("Satellite").triggered.connect(
                 lambda: self._raise_window(self.satellite_window))
+            win_menu.addAction("Environment (HRRR)").triggered.connect(
+                lambda: self._raise_window(self.hrrr_window))
             win_menu.addAction("Storm Tracks").triggered.connect(
                 lambda: self._raise_window(self.stormtrack_window))
             win_menu.addAction("Logs").triggered.connect(
@@ -280,6 +298,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
                 self.logs_window.move(500, 600)
                 self.lightning_window.move(40, 620)
                 self.satellite_window.move(40, 880)
+                self.hrrr_window.move(420, 880)
                 self.stormtrack_window.move(1280, 60)
             else:
                 for name, win in self._geo_windows.items():
@@ -290,6 +309,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             self.logs_window.show()
             self.lightning_window.show()
             self.satellite_window.show()
+            self.hrrr_window.show()
             self.stormtrack_window.show()
 
         def _save_geometry(self) -> None:
@@ -305,6 +325,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             self.logs_window.close()
             self.lightning_window.close()
             self.satellite_window.close()
+            self.hrrr_window.close()
             self.stormtrack_window.close()
             from PySide6.QtWidgets import QApplication
             QApplication.instance().quit()
@@ -340,7 +361,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
 
             from .detection.detection_v2 import Tracker
             from .detection.detection_v2 import run as scit_run
-            from .pipeline import VolumeResult
+            from .pipeline import VolumeResult, annotate_vault_results
 
             # Tracking is stateful across the volume sequence, so re-run the whole
             # warning in chronological order through a fresh tracker.
@@ -358,6 +379,9 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
                     cells=cells, index=res.index, total=res.total,
                     settings_hash=self.params.settings_hash,
                 ))
+            # Fresh cells lost their vault annotation — re-derive it from the
+            # already-fetched freezing-level grids (no-op without any).
+            annotate_vault_results(rebuilt, self._hrrr_grids, self.settings.vault)
             self._results[wid] = rebuilt
 
             # Refresh the detection-driven views; leave lightning/satellite
@@ -421,6 +445,8 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             self._reset_lightning()
             self.satellite_window.set_warning(warning)
             self._reset_satellite()
+            self.hrrr_window.set_warning(warning)
+            self._reset_hrrr()
             self.stormtrack_window.set_warning(warning)
             self.map.clear_stormtrack()
             for res in self._results.get(warning.id, []):
@@ -459,6 +485,8 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             self._reset_lightning()
             self.satellite_window.set_warning(warning)
             self._reset_satellite()
+            self.hrrr_window.set_warning(warning)
+            self._reset_hrrr()
             self.stormtrack_window.set_warning(warning)
             self.map.clear_stormtrack()
 
@@ -523,7 +551,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             and doing that on the QThreadPool worker segfaults in PROJ.
             """
             from .detection.detection_v2 import run as scit_run
-            from .pipeline import VolumeResult
+            from .pipeline import VolumeResult, annotate_vault_results
 
             # Cache the warning + this gridded volume to disk so the download
             # persists across launches (replayed later via FixtureVolumeSource).
@@ -550,6 +578,9 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
                 warning=warning, site=site, volume=volume, cells=cells,
                 index=index, total=total, settings_hash=self.params.settings_hash,
             )
+            # Vault/OT annotation, if the freezing level is already in (no-op
+            # otherwise — a later HRRR fetch re-annotates every volume).
+            annotate_vault_results([res], self._hrrr_grids, self.settings.vault)
             if getattr(self, "_dl_persistence", None) is not None:
                 try:
                     self._dl_persistence.upsert_cells(
@@ -570,6 +601,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
                 self.map.show_result(res.warning, res.volume, res.cells)
                 self._show_lightning_for(res.volume)
                 self._show_satellite_for(res.volume)
+                self._show_hrrr_for(res.volume)
                 self._refresh_tracks()
             self.statusBar().showMessage(
                 f"{res.warning.event}  {res.volume.valid_time:%H%MZ}  "
@@ -617,6 +649,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
                 self.map.show_cell_selection(self._map_warning, volume, cells, cell)
                 self._show_lightning_for(volume)
                 self._show_satellite_for(volume)
+                self._show_hrrr_for(volume)
 
         def _on_error(self, msg: str) -> None:
             log.error("worker.error", msg=msg)
@@ -711,6 +744,160 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             self._lightning_span = None
             self._current_valid_time = None
             self.map.clear_lightning()
+
+        # --- environment (HRRR freezing level / vault) ---------------------
+
+        def _reset_hrrr(self) -> None:
+            """Drop the previous warning's freezing-level grids (view switch)."""
+            self._hrrr_grids = []
+
+        def _clear_hrrr(self) -> None:
+            """Clear button: drop the grids AND strip the vault annotations."""
+            self._hrrr_grids = []
+            for res in self._results.get(self._selected_id, []):
+                for c in res.cells:
+                    c.freezing_level_km = None
+                    c.vault_top_km = None
+                    c.vault_depth_km = None
+                    c.overshooting_top = False
+                self.volumes.add_result(res)
+            self._refresh_tracks()
+            self.hrrr_window.count_label.setText("")
+            self.hrrr_window.set_level("")
+            self.hrrr_window.set_status("Cleared.")
+
+        def _vault_cell_count(self) -> int:
+            return sum(
+                1 for r in self._results.get(self._selected_id, [])
+                for c in r.cells if c.overshooting_top
+            )
+
+        def on_fetch_hrrr(self, warning) -> None:
+            """Pull HRRR 0°C freezing-level grids and run vault/OT detection."""
+            import math
+
+            from .config import DEFAULT_GRID, HRRR_MODULES
+            from .data.hrrr import HRRRSource
+            from .data.radar_render import geo_bounds
+            from .data.volumes import bounded_window
+
+            missing = missing_modules(HRRR_MODULES)
+            if missing:
+                self.hrrr_window.set_busy(False)
+                self.hrrr_window.set_status(
+                    f"HRRR needs the live extra ({', '.join(missing)} "
+                    f"missing) — {LIVE_EXTRA_HINT}"
+                )
+                return
+
+            w0, w1 = bounded_window(
+                warning.issued, warning.expires,
+                self.settings.pre_minutes, self.settings.post_minutes,
+            )
+            # Crop the freezing-level grid to the NEXRAD volume footprint (the
+            # radar analysis-grid extent), same as the satellite pull, so every
+            # detected cell samples inside the raster.
+            site = self.resolver.for_polygon(warning.polygon)
+            pad = self.settings.hrrr_bbox_pad_deg
+            results = self._results.get(warning.id) or []
+            if results:
+                lon_min, lon_max, lat_min, lat_max = geo_bounds(results[0].volume)
+                bbox = (lon_min - pad, lat_min - pad, lon_max + pad, lat_max + pad)
+            else:
+                half = DEFAULT_GRID.half_width_km
+                dlat = half / 110.574
+                dlon = half / (111.320 * max(0.1, math.cos(math.radians(site.lat))))
+                bbox = (site.lon - dlon - pad, site.lat - dlat - pad,
+                        site.lon + dlon + pad, site.lat + dlat + pad)
+
+            self._hrrr_grids = []
+            if not results:
+                self.hrrr_window.set_status(
+                    f"HRRR: {w0:%H:%MZ}–{w1:%H:%MZ} — no radar yet, vault "
+                    "detection runs once volumes are in."
+                )
+            else:
+                self.hrrr_window.set_status(f"HRRR: {w0:%H:%MZ}–{w1:%H:%MZ}…")
+
+            log.info("hrrr.fetch", warning=warning.id,
+                     start=w0.isoformat(), end=w1.isoformat())
+            cancel = threading.Event()
+            source = HRRRSource(
+                w0, w1, bbox, target_res_deg=self.settings.hrrr_target_res_deg,
+            )
+            worker = HRRRWorker(warning, source, cancel)
+            worker.signals.status.connect(self.hrrr_window.set_status)
+            worker.signals.grid_ready.connect(self._on_hrrr_grid)
+            worker.signals.error.connect(
+                lambda m: self.hrrr_window.set_status("Error: " + m.splitlines()[0])
+            )
+            worker.signals.finished.connect(lambda: self.hrrr_window.set_busy(False))
+            self._workers.append(worker)
+            self.pool.start(worker)
+
+        def _on_hrrr_grid(self, warning, grid, index, total) -> None:
+            """GUI-thread vault detection + refresh for one freezing-level grid.
+
+            The worker already downloaded and resampled the grid; here we cache
+            it, re-run vault detection over the warning's volumes (which needs
+            the in-memory radar results, hence this thread), and refresh the
+            listings so the vault/OT segments appear.
+            """
+            from .pipeline import annotate_vault_results
+
+            try:
+                self.downloads.save_warning(warning)
+                self.downloads.save_flevel(warning.id, grid)
+            except Exception as e:  # noqa: BLE001 - caching must never break a run
+                log.error("gui.flevel_cache_error", warning=warning.id, error=str(e))
+
+            self._hrrr_grids.append(grid)
+            self._hrrr_grids.sort(key=lambda g: g.valid_time)
+
+            if warning.id != self._selected_id:
+                return
+            results = self._results.get(warning.id, [])
+            if results:
+                annotate_vault_results(results, self._hrrr_grids, self.settings.vault)
+                for res in results:
+                    self.volumes.add_result(res)
+                self._refresh_tracks()
+            self.hrrr_window.set_count(len(self._hrrr_grids), self._vault_cell_count())
+            self._show_hrrr_for()
+            self.statusBar().showMessage(
+                f"{warning.event}  HRRR 0°C level {grid.valid_time:%H%MZ}  "
+                f"{index}/{total}"
+            )
+
+        def _show_hrrr_for(self, volume=None) -> None:
+            """Label the freezing level for the radar volume now on the map.
+
+            Cheap: picks the grid nearest the displayed volume's time and shows
+            its 0°C height at the warning centroid (raster mean as fallback), so
+            the Environment window tracks playback like the other overlays.
+            """
+            import math
+
+            if not self._hrrr_grids:
+                return
+            t = volume.valid_time if volume is not None else self._current_valid_time
+            if t is None:
+                grid = self._hrrr_grids[-1]
+            else:
+                grid = min(
+                    self._hrrr_grids,
+                    key=lambda g: abs((g.valid_time - t).total_seconds()),
+                )
+            level_m = float("nan")
+            if self._selected_warning is not None:
+                lon, lat = self._selected_warning.centroid
+                level_m = grid.height_at(lon, lat)
+            if not math.isfinite(level_m):
+                level_m = grid.mean_height_m()
+            if math.isfinite(level_m):
+                self.hrrr_window.set_level(
+                    f"0°C level {level_m / 1000.0:.1f} km MSL @ {grid.valid_time:%H:%MZ}"
+                )
 
         # --- satellite (GOES ABI cloud tops) ------------------------------
 
@@ -842,8 +1029,8 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             The worker already detected and tracked the cloud-top cells; here we
             tilt them against the nearest radar volume (which lives on this
             thread) — which also annotates that volume's storms with cloud-top
-            temperature + OT — then cache, persist, refresh the listing, and
-            overlay the scene on the map.
+            temperature — then cache, persist, refresh the listing, and overlay
+            the scene on the map.
             """
             from .detection.cloudtop import associate_radar
 
@@ -862,9 +1049,9 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
                     ),
                 )
                 associate_radar(cells, radar_res.cells, self._sat_tracker.params)
-                # The matched volume's storms now carry cloud-top temp + OT —
-                # refresh its row so the volume listing shows them, and rebuild
-                # the track charts so the cloud-top/OT series pick them up.
+                # The matched volume's storms now carry cloud-top temp —
+                # refresh its row so the volume listing shows it, and rebuild
+                # the track charts so the cloud-top series picks it up.
                 if warning.id == self._selected_id:
                     self.volumes.add_result(radar_res)
                     self._refresh_tracks()
@@ -885,8 +1072,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
                 self._current_sat_time = None  # force a re-pick
                 self._show_satellite_for()
             n_cells = sum(len(c) for _, c in self._sat_results)
-            n_ot = sum(1 for _, c in self._sat_results for x in c if x.overshooting_top)
-            self.satellite_window.set_count(len(self._sat_results), n_cells, n_ot)
+            self.satellite_window.set_count(len(self._sat_results), n_cells)
             self.statusBar().showMessage(
                 f"{warning.event}  satellite {scene.valid_time:%H%MZ}  "
                 f"{index}/{total}  {len(cells)} cloud-top(s)"
@@ -1071,6 +1257,25 @@ def run_smoke(args: argparse.Namespace) -> int:
         window._on_scene(last_warning, scene, cells, 1, 1)
         assert window._sat_results, "satellite scene did not register"
 
+    # Drive the HRRR/vault path offscreen too: a synthetic freezing-level grid
+    # straight through _on_hrrr_grid (vault detection + volume-listing refresh
+    # + counts), proving the wiring without any network.
+    if last_warning is not None:
+        from .data.synthetic import make_freezing_grid
+        window._reset_hrrr()
+        lon0, lat0, lon1, lat1 = last_warning.polygon.bounds
+        grid = make_freezing_grid(
+            last_warning.issued,
+            (lon0 - 1.5, lat0 - 1.5, lon1 + 1.5, lat1 + 1.5),
+            level_m=3000.0,
+        )
+        window._on_hrrr_grid(last_warning, grid, 1, 1)
+        assert window._hrrr_grids, "freezing-level grid did not register"
+        assert any(
+            c.freezing_level_km is not None
+            for r in window._results.get(last_warning.id, []) for c in r.cells
+        ), "vault detection did not annotate the cells"
+
     # Storm Track window: rebuild its track listing from the processed volumes
     # and drive a selection through to the map, proving the wiring end-to-end.
     if last_warning is not None:
@@ -1090,9 +1295,10 @@ def run_smoke(args: argparse.Namespace) -> int:
 
     app.processEvents()
     print(
-        "smoke: panes (search, volumes, map, model, satellite, storm-track) + "
-        "settings/download dialogs instantiated, fixture + cloud-top scene "
-        "rendered, storm tracks built — OK"
+        "smoke: panes (search, volumes, map, model, satellite, hrrr, "
+        "storm-track) + settings/download dialogs instantiated, fixture + "
+        "cloud-top scene rendered, freezing level + vault annotated, storm "
+        "tracks built — OK"
     )
     # The real smoke work is done. Reap the private Xvfb (if any) and hard-exit
     # 0: VTK/GL stacks can SIGABRT during interpreter teardown (a cosmetic

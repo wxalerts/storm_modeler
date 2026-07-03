@@ -103,6 +103,61 @@ class LightningWorker(QRunnable):
             self.signals.finished.emit()
 
 
+class HRRRSignals(QObject):
+    # (warning, FreezingLevelGrid, index, total) — the worker downloads +
+    # decodes + resamples (pure NumPy LCC, no pyproj); the GUI thread runs
+    # vault detection against the in-memory radar results and refreshes views.
+    grid_ready = Signal(object, object, int, int)
+    status = Signal(str)  # human-readable sub-step line (idx/download/decode)
+    error = Signal(str)
+    finished = Signal()
+
+
+class HRRRWorker(QRunnable):
+    """Fetch HRRR 0 °C freezing-level grids for one warning, off the GUI thread.
+
+    Streams hourly analyses from :class:`storm_modeler.data.hrrr.HRRRSource`
+    (idx byte-range download + pygrib decode + Lambert-conformal→lon/lat
+    resample, all pyproj-free, so worker-safe) and emits each grid for the GUI
+    to run vault detection with and cache. Cancellation is a checked
+    ``threading.Event``.
+    """
+
+    def __init__(
+        self,
+        warning: Warning,
+        grid_source,
+        cancel: threading.Event | None = None,
+    ) -> None:
+        super().__init__()
+        self.warning = warning
+        self.grid_source = grid_source
+        self.cancel = cancel or threading.Event()
+        self.signals = HRRRSignals()
+
+    def request_cancel(self) -> None:
+        self.cancel.set()
+
+    @Slot()
+    def run(self) -> None:  # noqa: D401 - QRunnable entry point
+        try:
+            self.grid_source.set_status_callback(self.signals.status.emit)
+            try:
+                total = int(self.grid_source.estimated_count())
+            except Exception:  # noqa: BLE001
+                total = 0
+            for i, grid in enumerate(self.grid_source.grids(self.cancel), 1):
+                if self.cancel.is_set():
+                    break
+                total = max(total, i)
+                self.signals.grid_ready.emit(self.warning, grid, i, total)
+        except Exception as e:  # noqa: BLE001
+            log.error("hrrr.run_error", error=str(e))
+            self.signals.error.emit(f"{type(e).__name__}: {e}")
+        finally:
+            self.signals.finished.emit()
+
+
 class SatelliteSignals(QObject):
     # (warning, SatelliteScene, list[CloudTopCell], index, total) — the worker
     # downloads, reprojects (pure NumPy, no pyproj), detects, and tracks; the

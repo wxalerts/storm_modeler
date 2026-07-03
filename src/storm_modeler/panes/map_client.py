@@ -70,8 +70,8 @@ def _cloudtop_features(cloudtops) -> dict:
     """GeoJSON for cloud-top cells: anvil footprints + coldest-pixel markers.
 
     Each cell yields its envelope polygon (flagged ``anvil`` when anviled out)
-    and a point at the coldest pixel (``ot`` when an overshooting top), carrying
-    BT and tilt in the properties for map popups.
+    and a point at the coldest pixel, carrying BT and tilt in the properties
+    for map popups.
     """
     feats = []
     for c in cloudtops:
@@ -80,7 +80,6 @@ def _cloudtop_features(cloudtops) -> dict:
             "mean_bt_k": round(c.mean_bt_k, 1),
             "area_km2": round(c.area_km2, 0),
             "track_id": c.track_id,
-            "ot": bool(c.overshooting_top),
             "anvil": bool(c.anviled_out),
         }
         import math as _math
@@ -92,7 +91,7 @@ def _cloudtop_features(cloudtops) -> dict:
                       "properties": {**props, "kind": "anvil" if c.anviled_out else "cloud"},
                       "geometry": mapping(c.envelope)})
         feats.append({"type": "Feature",
-                      "properties": {**props, "kind": "ot" if c.overshooting_top else "core"},
+                      "properties": {**props, "kind": "core"},
                       "geometry": {"type": "Point", "coordinates": [c.cold_lon, c.cold_lat]}})
     return {"type": "FeatureCollection", "features": feats}
 
