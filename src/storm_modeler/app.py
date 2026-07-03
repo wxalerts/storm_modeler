@@ -648,14 +648,11 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
         # --- rotation couplets ---------------------------------------------
 
         def _couplet_params(self):
-            """The rotation-detection knob set (registry-backed defaults)."""
-            from .settings.resolver import CoupletParams
-            # NOTE: switches to the resolved settings projection once the
-            # rotation settings group lands (next phase); defaults match it.
-            return CoupletParams()
+            """The rotation-detection knob set, resolved from settings."""
+            return self.settings.couplets
 
         def _couplet_marker_min_kt(self) -> float:
-            return float(self.settings.get("couplet_marker_min_vrot_kt", 15.0))
+            return self.settings.couplet_marker_min_vrot_kt
 
         def _annotate_couplets(self, res, results) -> None:
             """Detect this volume's velocity couplets (never fatal to the run).

@@ -18,7 +18,13 @@ from typing import Any
 
 from pathlib import Path
 
-from .registry import CLOUDTOP_KEYS, DETECTION_KEYS, VAULT_KEYS, defaults
+from .registry import (
+    CLOUDTOP_KEYS,
+    COUPLET_KEYS,
+    DETECTION_KEYS,
+    VAULT_KEYS,
+    defaults,
+)
 from .store import open_store
 
 
@@ -98,6 +104,11 @@ class CoupletParams:
         """Stable short digest of the knob set (provenance)."""
         payload = json.dumps(asdict(self), sort_keys=True, default=str)
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "CoupletParams":
+        # registry key "couplet_min_shear_s1" → field "min_shear_s1", etc.
+        return cls(**{k[len("couplet_"):]: d[k] for k in COUPLET_KEYS if k in d})
 
 
 @dataclass(frozen=True)
@@ -183,6 +194,16 @@ class ResolvedSettings:
     @property
     def hrrr_target_res_deg(self) -> float:
         return float(self.values.get("hrrr_target_res_deg", 0.03))
+
+    # -- Rotation (velocity couplets) projections ---------------------------
+
+    @property
+    def couplets(self) -> CoupletParams:
+        return CoupletParams.from_dict(self.values)
+
+    @property
+    def couplet_marker_min_vrot_kt(self) -> float:
+        return float(self.values.get("couplet_marker_min_vrot_kt", 15.0))
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.values.get(key, default)

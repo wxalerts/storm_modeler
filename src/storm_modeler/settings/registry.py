@@ -20,6 +20,7 @@ GROUP_VIEWER = "Viewer (3D)"
 GROUP_LIGHTNING = "Lightning"
 GROUP_SATELLITE = "Satellite (GOES ABI)"
 GROUP_HRRR = "Environment (HRRR)"
+GROUP_ROTATION = "Rotation (couplets)"
 
 
 @dataclass(frozen=True)
@@ -213,6 +214,29 @@ REGISTRY: tuple[SettingSpec, ...] = (
                 "float", 0.03, "Regular lon/lat raster spacing for the "
                 "resampled freezing-level grid (native HRRR is ~3 km).",
                 min=0.01, max=0.25),
+    # -- Rotation (velocity couplets) ---------------------------------------
+    # Grid-scale starting points, expected to be tuned in-app (the 2026-03-10
+    # LOT case is the reference event).
+    SettingSpec("couplet_min_shear_s1", "Min azimuthal shear (s^-1)",
+                GROUP_ROTATION, "float", 0.004, "Peak |azimuthal shear| at/"
+                "above which grid points seed a rotation couplet.",
+                min=0.0005, max=0.05),
+    SettingSpec("couplet_min_area_km2", "Min couplet area (km^2)",
+                GROUP_ROTATION, "float", 4.0, "Minimum connected hot-shear "
+                "footprint to admit a couplet (rejects speckle).",
+                min=0.0, max=1000.0),
+    SettingSpec("couplet_max_range_km", "Max range (km)", GROUP_ROTATION,
+                "float", 150.0, "Couplets beyond this range from the radar "
+                "are ignored (beam broadening; the near gate is fixed at "
+                "5 km).", min=10.0, max=300.0),
+    SettingSpec("couplet_assoc_max_km", "Motion association max (km)",
+                GROUP_ROTATION, "float", 10.0, "Max couplet-to-cell centroid "
+                "distance to take that cell track's motion for the "
+                "storm-relative Vrot.", min=0.0, max=100.0),
+    SettingSpec("couplet_marker_min_vrot_kt", "Marker min Vrot (kt)",
+                GROUP_ROTATION, "float", 15.0, "Couplets below this "
+                "storm-relative Vrot are detected but not drawn on the map.",
+                min=0.0, max=100.0),
 )
 
 REGISTRY_BY_KEY: dict[str, SettingSpec] = {s.key: s for s in REGISTRY}
@@ -237,6 +261,16 @@ CLOUDTOP_KEYS: tuple[str, ...] = (
 # keys are ingest choices, not detection knobs, so they are excluded.
 VAULT_KEYS: tuple[str, ...] = (
     "hrrr_vault_dbz", "hrrr_vault_min_depth_km",
+)
+
+# Rotation-couplet detection knob set. Deliberately NOT in DETECTION_KEYS:
+# couplets are an unpersisted display addon in this phase, so they carry no
+# settings_hash provenance. If/when couplets are persisted (PostGIS, meso
+# tracking), these keys must join a provenance hash like the other detectors.
+# The marker threshold is a display knob and stays out of the params set.
+COUPLET_KEYS: tuple[str, ...] = (
+    "couplet_min_shear_s1", "couplet_min_area_km2", "couplet_max_range_km",
+    "couplet_assoc_max_km",
 )
 
 
