@@ -143,6 +143,45 @@ class NexradArchiveSource(VolumeSource):
             yield vol
 
 
+def _velocity_range_folded(file_obj, nrays: int, max_ngates: int):
+    """Per-gate range-folded mask for the VEL moment, aligned to the Radar rows.
+
+    NEXRAD Level II encodes raw moment value 0 as below-threshold and 1 as
+    **range folded**; Py-ART masks both away (``data <= 1``), so the RF signal
+    never reaches the Radar object. The velocity display wants it as its own
+    color (AWIPS ``Vel.cmap`` index 1) — RF gates beside a couplet are
+    themselves a signal that the velocities there are extreme — so re-decode
+    the archive bytes and keep ``raw == 1`` within each ray's real gate count
+    (beyond it, 1 is only ``get_data``'s pad value). The second decode costs
+    a couple of seconds, small next to Barnes gridding. Returns a
+    ``(nrays, max_ngates)`` bool array, or ``None`` when the file can't be
+    re-read or the ray count doesn't line up (e.g. legacy volumes whose gate
+    spacing Py-ART interpolates — those are left without an RF layer).
+    """
+    import numpy as np
+    from pyart.io.nexrad_level2 import NEXRADLevel2File  # type: ignore
+
+    try:
+        file_obj.seek(0)
+        nfile = NEXRADLevel2File(file_obj)
+        msg_nums = nfile._msg_nums(range(nfile.nscans))
+        if len(msg_nums) != nrays:
+            log.info("grid.rf_skipped", reason="ray count mismatch",
+                     rays=len(msg_nums), expected=nrays)
+            return None
+        rf = np.zeros((nrays, max_ngates), dtype=bool)
+        for i, msg_num in enumerate(msg_nums):
+            msg = nfile.radial_records[msg_num]
+            if "VEL" not in msg.keys():
+                continue
+            ng = min(msg["VEL"]["ngates"], max_ngates, len(msg["VEL"]["data"]))
+            rf[i, :ng] = np.asarray(msg["VEL"]["data"][:ng]) == 1
+        return rf
+    except Exception as e:  # noqa: BLE001 - RF is an enhancement, never fatal
+        log.info("grid.rf_skipped", reason=str(e).splitlines()[0])
+        return None
+
+
 def grid_level2(
     file_obj,
     site: str,
@@ -160,6 +199,7 @@ def grid_level2(
     :class:`GriddedVolume` contract SCIT consumes. ``on_status(message)``, if
     given, receives a human-readable line per slow phase (decode, interpolate).
     """
+    import io
     import time
 
     import numpy as np
@@ -171,7 +211,10 @@ def grid_level2(
 
     status("Decoding radar volume…")
     t0 = time.perf_counter()
-    radar = pyart.io.read_nexrad_archive(file_obj)
+    # Buffer the archive bytes: read_nexrad_archive closes the handle it is
+    # given, and the range-folded extraction below needs a second pass.
+    data = file_obj.read()
+    radar = pyart.io.read_nexrad_archive(io.BytesIO(data))
     log.info("grid.read_done", site=site, nrays=int(radar.nrays),
              nsweeps=int(radar.nsweeps), secs=round(time.perf_counter() - t0, 2))
 
@@ -185,6 +228,23 @@ def grid_level2(
               "differential_reflectivity", "cross_correlation_ratio",
               "differential_phase"]
     present = [f for f in wanted if f in radar.fields]
+
+    # Range-folded velocity gates ride along as their own 0/1 field so the
+    # velocity display can paint them (AWIPS Vel.cmap index 1) instead of
+    # dropping them with the below-threshold gates.
+    if "velocity" in present:
+        rf = _velocity_range_folded(io.BytesIO(data), int(radar.nrays),
+                                    int(radar.ngates))
+        if rf is not None:
+            radar.add_field(
+                "range_folded",
+                {"data": rf.astype("float32"), "units": "",
+                 "long_name": "velocity range folded flag",
+                 "_FillValue": -9999.0},
+                replace_existing=True,
+            )
+            present = present + ["range_folded"]
+    del data  # the (possibly large) archive copy is no longer needed
 
     status(f"Interpolating {len(present)} product(s) to {nz}×{ny}×{nx} grid…")
     log.info("grid.interp_begin", site=site, shape=(nz, ny, nx),
@@ -214,9 +274,27 @@ def grid_level2(
     refl = field3d("reflectivity")
     products: dict[str, np.ndarray] = {}  # reflectivity composite is added by the model
     for name in present:
-        if name == "reflectivity":
+        if name in ("reflectivity", "velocity", "range_folded"):
             continue
         products[name] = lowest_valid(field3d(name))
+
+    if "velocity" in present:
+        if "range_folded" in present:
+            # Lowest level where the radar *observed* the column — valid
+            # velocity or range folded. Where that lowest observation is RF,
+            # show RF (as the single-tilt NWS display would) instead of
+            # silently substituting a higher tilt's velocity.
+            vel3 = field3d("velocity")
+            rf3 = np.nan_to_num(field3d("range_folded"), nan=0.0) >= 0.5
+            observed = np.isfinite(vel3) | rf3
+            has = observed.any(axis=0)
+            idx = observed.argmax(axis=0)  # first observed level per column
+            vel2 = np.take_along_axis(vel3, idx[None], axis=0)[0]
+            rf2 = np.take_along_axis(rf3, idx[None], axis=0)[0] & has
+            products["velocity"] = np.where(has & ~rf2, vel2, np.nan)
+            products["range_folded"] = rf2.astype(np.float32)
+        else:
+            products["velocity"] = lowest_valid(field3d("velocity"))
 
     x = gridded.x["data"].astype(np.float64)
     y = gridded.y["data"].astype(np.float64)
