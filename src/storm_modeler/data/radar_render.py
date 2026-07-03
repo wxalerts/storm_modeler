@@ -126,6 +126,61 @@ def bt_to_rgba(bt_k: np.ndarray, vmin: float = 180.0, vmax: float = 300.0) -> np
     return rgba
 
 
+# --- storm-relative velocity -------------------------------------------------
+
+#: Motion (u_ms, v_ms) each volume's cached SRM layer was derived with, stored
+#: as a plain attribute on the volume (not a dataclass field, so ``save_npz``
+#: never persists it and the on-disk cache format is untouched).
+_SRM_MOTION_ATTR = "_srm_motion_uv"
+#: Motion change (m/s, either component) below which the cached layer is kept.
+_SRM_MOTION_TOL = 0.1
+
+
+def derive_srm(volume: GriddedVolume, u_ms: float, v_ms: float) -> np.ndarray:
+    """Storm-relative radial velocity: base velocity minus the storm-motion
+    projection onto each radial. NaN-preserving.
+
+    The radar sits at the grid origin, so the radial unit vector at (x, y) is
+    simply ``(x, y)/r`` — no azimuth trig. ``r`` is floored at 1 m so the
+    origin cell never divides by zero. Deterministic for a given (volume,
+    motion); dtype follows the base layer's promotion (the caller casts for
+    display storage).
+    """
+    v_base = volume.product_2d("velocity")
+    if v_base is None:
+        raise ValueError("volume has no velocity layer to derive SRM from")
+    xx, yy = np.meshgrid(volume.x, volume.y)
+    r = np.maximum(np.hypot(xx, yy), 1.0)
+    return v_base - (float(u_ms) * xx + float(v_ms) * yy) / r
+
+
+def ensure_srm_layer(
+    volume: GriddedVolume, u_ms: float, v_ms: float
+) -> np.ndarray | None:
+    """Compute-and-stash the SRM display layer for ``volume`` (idempotent).
+
+    Writes ``products["storm_relative_velocity"]`` and records the motion used
+    on the volume object; a repeat call recomputes only when either motion
+    component moved by more than 0.1 m/s. Returns the layer, or ``None`` when
+    the volume carries no base velocity (older cached volumes) — the map then
+    falls back to reflectivity via its usual missing-product path.
+    """
+    if volume.product_2d("velocity") is None:
+        return None
+    prev = getattr(volume, _SRM_MOTION_ATTR, None)
+    if (
+        prev is not None
+        and "storm_relative_velocity" in volume.products
+        and abs(prev[0] - u_ms) <= _SRM_MOTION_TOL
+        and abs(prev[1] - v_ms) <= _SRM_MOTION_TOL
+    ):
+        return volume.products["storm_relative_velocity"]
+    layer = derive_srm(volume, u_ms, v_ms).astype(np.float32)
+    volume.products["storm_relative_velocity"] = layer
+    setattr(volume, _SRM_MOTION_ATTR, (float(u_ms), float(v_ms)))
+    return layer
+
+
 def radar_polydata(volume: GriddedVolume, z: float = 0.0):
     """A geo-aligned ``pyvista.StructuredGrid`` carrying per-point RGBA.
 
@@ -163,6 +218,10 @@ PRODUCTS: list[dict] = [
     {"key": "reflectivity", "label": "Reflectivity", "units": "dBZ"},
     {"key": "velocity", "label": "Velocity", "units": "m/s",
      "vmin": -32.0, "vmax": 32.0},
+    # Derived, not gridded: the layer is injected per volume by
+    # ensure_srm_layer once a storm motion is known. Shares the AWIPS LUT.
+    {"key": "storm_relative_velocity", "label": "SRM", "units": "m/s",
+     "vmin": -32.0, "vmax": 32.0},
     {"key": "spectrum_width", "label": "Spectrum Width", "units": "m/s",
      "cmap": "plasma", "vmin": 0.0, "vmax": 14.0},
     {"key": "differential_reflectivity", "label": "ZDR", "units": "dB",
@@ -185,7 +244,7 @@ def _colorize(
     """
     if product == "reflectivity":
         return dbz_to_rgba(field2d)
-    if product == "velocity":
+    if product in ("velocity", "storm_relative_velocity"):
         meta = _PRODUCT_BY_KEY[product]
         return vel_to_rgba(field2d, meta["vmin"], meta["vmax"], range_folded)
     import matplotlib
@@ -240,7 +299,7 @@ def product_lonlat_image(
     # themselves a signal that the velocities there are extreme. Volumes
     # cached before RF existed simply lack the layer.
     rf_mask = None
-    if product == "velocity":
+    if product in ("velocity", "storm_relative_velocity"):
         rf2d = volume.product_2d("range_folded")
         if rf2d is not None:
             rf2d = np.where(np.hypot(xx, yy) <= rmax, rf2d, 0.0)
