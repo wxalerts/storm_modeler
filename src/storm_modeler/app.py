@@ -443,6 +443,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             self._sources[warning.id] = lambda: S3Level2Source(
                 site.icao, w0, w1, site.lat, site.lon,
                 h_km=self.params.grid_h_km, v_km=self.params.grid_v_km,
+                dealias=bool(self.settings.get("dealias_velocity", True)),
             )
             self.search.add_result(warning)
 

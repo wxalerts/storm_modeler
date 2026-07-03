@@ -102,6 +102,15 @@ REGISTRY: tuple[SettingSpec, ...] = (
                 "track.", min=0.0, max=100.0),
     SettingSpec("track_miss_max", "Track miss tolerance", GROUP_DETECTION, "int",
                 2, "Volumes a track may be unmatched before it ends.", min=0, max=10),
+    # Grouped under Detection for the dialog, but deliberately NOT in
+    # DETECTION_KEYS: it conditions the velocity moment (display/SRM/couplets),
+    # not the reflectivity SCIT whose provenance that hash covers.
+    SettingSpec("dealias_velocity", "Dealias radial velocity", GROUP_DETECTION,
+                "bool", True, "Unfold aliased velocities (Py-ART region-based) "
+                "before gridding. Raw NEXRAD velocity folds at the Nyquist "
+                "(~±32 m/s); fold boundaries poison the velocity/SRM display "
+                "and rotation detection. Applies at download/grid time — "
+                "volumes cached earlier keep their folds until re-downloaded."),
     # -- Data window ------------------------------------------------------
     SettingSpec("pre_minutes", "Pre-window (min)", GROUP_DATA_WINDOW, "int",
                 60, "Minutes before issuance to start the volume pull.",
@@ -225,6 +234,16 @@ REGISTRY: tuple[SettingSpec, ...] = (
                 GROUP_ROTATION, "float", 4.0, "Minimum connected hot-shear "
                 "footprint to admit a couplet (rejects speckle).",
                 min=0.0, max=1000.0),
+    SettingSpec("couplet_max_area_km2", "Max couplet area (km^2)",
+                GROUP_ROTATION, "float", 100.0, "Maximum hot-shear footprint "
+                "to admit — mesocyclones are tens of km^2; larger components "
+                "are line-scale shear or aliasing debris.", min=1.0, max=5000.0),
+    SettingSpec("couplet_fold_jump_ms", "Fold-guard jump (m/s)",
+                GROUP_ROTATION, "float", 40.0, "Adjacent-grid-cell velocity "
+                "jump at/above which a component is treated as an aliasing "
+                "fold boundary and rejected (a fold is a fake ~2x-Nyquist "
+                "discontinuity). 0 disables — e.g. when dealiased volumes "
+                "make it redundant.", min=0.0, max=100.0),
     SettingSpec("couplet_max_range_km", "Max range (km)", GROUP_ROTATION,
                 "float", 150.0, "Couplets beyond this range from the radar "
                 "are ignored (beam broadening; the near gate is fixed at "
@@ -269,8 +288,8 @@ VAULT_KEYS: tuple[str, ...] = (
 # tracking), these keys must join a provenance hash like the other detectors.
 # The marker threshold is a display knob and stays out of the params set.
 COUPLET_KEYS: tuple[str, ...] = (
-    "couplet_min_shear_s1", "couplet_min_area_km2", "couplet_max_range_km",
-    "couplet_assoc_max_km",
+    "couplet_min_shear_s1", "couplet_min_area_km2", "couplet_max_area_km2",
+    "couplet_max_range_km", "couplet_assoc_max_km", "couplet_fold_jump_ms",
 )
 
 

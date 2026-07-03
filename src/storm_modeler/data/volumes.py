@@ -82,6 +82,7 @@ class NexradArchiveSource(VolumeSource):
         grid: GridConfig = DEFAULT_GRID,
         h_km: float = 1.0,
         v_km: float = 0.5,
+        dealias: bool = True,
     ) -> None:
         self.site = site
         self.start = start.astimezone(timezone.utc)
@@ -91,6 +92,7 @@ class NexradArchiveSource(VolumeSource):
         self.grid = grid
         self.h_km = h_km
         self.v_km = v_km
+        self.dealias = dealias
 
     def _list_keys(self) -> list[str]:
         """List archive object keys in the window (lazy s3fs)."""
@@ -138,7 +140,7 @@ class NexradArchiveSource(VolumeSource):
             with fs.open(key, "rb") as fh:
                 vol = grid_level2(
                     fh, self.site, self.lat0, self.lon0, self.grid,
-                    self.h_km, self.v_km,
+                    self.h_km, self.v_km, dealias=self.dealias,
                 )
             yield vol
 
@@ -191,6 +193,7 @@ def grid_level2(
     h_km: float = 1.0,
     v_km: float = 0.5,
     on_status=None,
+    dealias: bool = True,
 ) -> GriddedVolume:
     """Grid one archived Level II volume onto the local Cartesian grid.
 
@@ -198,6 +201,14 @@ def grid_level2(
     -equidistant tangent plane centred on the radar so the result matches the
     :class:`GriddedVolume` contract SCIT consumes. ``on_status(message)``, if
     given, receives a human-readable line per slow phase (decode, interpolate).
+
+    ``dealias`` unfolds the radial velocity (Py-ART region-based, Nyquist from
+    the volume's instrument parameters) before gridding. Raw NEXRAD velocity
+    folds at ±Vn (~±32 m/s), and a fold boundary is a fake ~2·Vn gate-to-gate
+    jump — the strongest "azimuthal shear" in the volume — which poisons the
+    velocity/SRM display and the couplet detector alike. Applies at grid time
+    only: volumes cached before this existed keep their folds until
+    re-downloaded.
     """
     import io
     import time
@@ -217,6 +228,20 @@ def grid_level2(
     radar = pyart.io.read_nexrad_archive(io.BytesIO(data))
     log.info("grid.read_done", site=site, nrays=int(radar.nrays),
              nsweeps=int(radar.nsweeps), secs=round(time.perf_counter() - t0, 2))
+
+    if dealias and "velocity" in radar.fields:
+        status("Dealiasing velocity…")
+        t_da = time.perf_counter()
+        try:
+            corrected = pyart.correct.dealias_region_based(
+                radar, vel_field="velocity"
+            )
+            radar.add_field("velocity", corrected, replace_existing=True)
+            log.info("grid.dealias_done", site=site,
+                     secs=round(time.perf_counter() - t_da, 2))
+        except Exception as e:  # noqa: BLE001 - folded beats no velocity at all
+            log.warning("grid.dealias_failed", site=site,
+                        reason=str(e).splitlines()[0])
 
     hw = grid.half_width_km * 1000.0
     nz, ny, nx = grid.nz(v_km), grid.nx(h_km), grid.nx(h_km)
@@ -348,6 +373,7 @@ class ThreddsLevel2Source(VolumeSource):
         grid: GridConfig = DEFAULT_GRID,
         h_km: float = 1.0,
         v_km: float = 0.5,
+        dealias: bool = True,
     ) -> None:
         self.site = site.upper()
         self.start = start.astimezone(timezone.utc)
@@ -357,6 +383,7 @@ class ThreddsLevel2Source(VolumeSource):
         self.grid = grid
         self.h_km = h_km
         self.v_km = v_km
+        self.dealias = dealias
         self._keys: list[tuple[datetime, str]] | None = None
 
     @staticmethod
@@ -433,7 +460,7 @@ class ThreddsLevel2Source(VolumeSource):
                 t1 = time.perf_counter()
                 vol = grid_level2(
                     io.BytesIO(content), self.site, self.lat0, self.lon0,
-                    self.grid, self.h_km, self.v_km,
+                    self.grid, self.h_km, self.v_km, dealias=self.dealias,
                     on_status=lambda m, i=i, n=n: self._emit_status(f"[{i}/{n}] {m}"),
                 )
                 log.info("thredds.grid_done", index=i, total=n,
@@ -495,6 +522,7 @@ class S3Level2Source(VolumeSource):
         grid: GridConfig = DEFAULT_GRID,
         h_km: float = 1.0,
         v_km: float = 0.5,
+        dealias: bool = True,
     ) -> None:
         self.site = site.upper()
         self.start = start.astimezone(timezone.utc)
@@ -504,6 +532,7 @@ class S3Level2Source(VolumeSource):
         self.grid = grid
         self.h_km = h_km
         self.v_km = v_km
+        self.dealias = dealias
         self._keys: list[tuple[datetime, str, int]] | None = None
         # How many volumes to download concurrently. Downloads are I/O-bound and
         # independent, so a small pool fetches ahead while the (slower) gridding
@@ -619,7 +648,7 @@ class S3Level2Source(VolumeSource):
                 t1 = time.perf_counter()
                 vol = grid_level2(
                     io.BytesIO(content), self.site, self.lat0, self.lon0,
-                    self.grid, self.h_km, self.v_km,
+                    self.grid, self.h_km, self.v_km, dealias=self.dealias,
                     on_status=lambda m, i=i, n=n: self._emit_status(f"[{i}/{n}] {m}"),
                 )
                 log.info("s3.grid_done", index=i, total=n,

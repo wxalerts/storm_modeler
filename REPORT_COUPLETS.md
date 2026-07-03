@@ -150,3 +150,40 @@ No SCIT/tracking/cache/SRM-module changes (SRM only imported); no meso
 tracking, no PostGIS, association limited to the motion-vector lookup;
 numpy/scipy/stdlib only; structlog events (`couplets.detected`,
 `gui.couplet_error`); deterministic ordering asserted by test.
+
+## Addendum — Pontiac investigation (aliasing) and fixes
+
+Field report: the strongest markers sat outside the warning polygon while the
+tornado ran through Pontiac. Diagnosis against the cached volumes: every
+"strongest" couplet had its velocity extrema **pinned at ±32–33 m/s (the
+Nyquist)** with 131–285 implausible >40 m/s-per-km jumps per volume — the
+markers were riding **aliasing fold boundaries** (the pipeline did no
+dealiasing), with component areas up to 434 km². The genuine Pontiac couplet
+existed (3.6 km away at 21:53 Z) but read ~15 kt, right at the marker cutoff.
+
+Fixes (commit below):
+
+1. **Dealias at grid time** — `grid_level2` now runs Py-ART region-based
+   dealiasing before gridding (new `dealias_velocity` setting, default on;
+   in the Detection dialog group but NOT in `DETECTION_KEYS`). A/B on a
+   re-downloaded 21:53 Z KLOT volume: velocity range −68…+52 m/s (truth)
+   instead of clipped ±32, fold boundaries halved; residual dealias seams are
+   caught by the guard below. **Cached volumes keep their folds until the
+   warning is re-downloaded.**
+2. **Fold guard** — components touching an adjacent-cell jump ≥
+   `couplet_fold_jump_ms` (default 40 m/s; 0 disables) are rejected as fold
+   artifacts; a genuine 25 m/s Rankine spreads its ΔV over the couplet
+   diameter (~6 m/s per km) and sails through (tested).
+3. **Max-area gate** — `couplet_max_area_km2` (default 100): mesocyclones are
+   tens of km²; the 300–400 km² line-scale blobs can no longer own a marker.
+4. **Core anchoring** — markers anchor on the |shear|-weighted centroid of
+   the component's ≥70 %-of-peak core, so merged components point at the
+   tightest rotation instead of the blob's middle.
+
+Post-fix, dealiased 21:59–22:15 Z regrids show the near-Pontiac rotation as
+9–18 km-distant couplets at 18–35 kt SR — modest but real numbers for a QLCS
+mesovortex ~93 km from KLOT, where the beam sits ~1.4 km AGL and 1-km Barnes
+gridding smears a 1–3 km vortex. Sharper localisation would need a finer
+`grid_h_km` and/or a couplet-scale shear kernel (future work). New tests:
+fold-guard rejection, max-area gate, guard-survival of a real vortex
+(115 passed, 1 skipped).

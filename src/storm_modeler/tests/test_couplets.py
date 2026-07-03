@@ -153,6 +153,55 @@ def test_range_gates():
     assert detect_couplets(far, [], CoupletParams(max_range_km=30.0)) == []
 
 
+def _fold_patch_volume() -> GriddedVolume:
+    """An aliasing-fold lookalike: a +30 m/s island in a −30 m/s background.
+
+    The patch edge is a fake 60 m/s adjacent-cell discontinuity — exactly what
+    a Nyquist fold boundary looks like after gridding — producing enormous
+    apparent azimuthal shear with no rotation anywhere.
+    """
+    x = np.linspace(-50000.0, 50000.0, 101)
+    z = np.array([500.0, 1000.0])
+    refl = np.full((z.size, x.size, x.size), np.nan, dtype=np.float32)
+    vol = GriddedVolume("KLOT", T0, refl, x, x, z, 41.6044, -88.0847)
+    vel = np.full((x.size, x.size), -30.0)
+    vel[80:88, 68:76] = 30.0  # 8×8 km patch centred ~(22, 33.5) km, r≈40 km
+    vol.products["velocity"] = vel
+    return vol
+
+
+def test_fold_guard_rejects_aliasing_patch():
+    vol = _fold_patch_volume()
+    # Defaults: every hot-shear component rides the 60 m/s discontinuity.
+    assert detect_couplets(vol, [], CoupletParams()) == []
+    # Disable the guard (and the area cap): the artifact sails through —
+    # extrema pinned at the fold values.
+    loose = CoupletParams(fold_jump_ms=0.0, max_area_km2=100000.0)
+    got = detect_couplets(vol, [], loose)
+    assert got, "with the guard off the artifact should be detected"
+    assert got[0].v_max_ms == 30.0 and got[0].v_min_ms == -30.0
+
+
+def test_max_area_gate_rejects_line_scale_blobs():
+    vol = _fold_patch_volume()
+    loose = CoupletParams(fold_jump_ms=0.0, max_area_km2=100000.0)
+    got = detect_couplets(vol, [], loose)
+    assert got
+    biggest = max(c.area_km2 for c in got)
+    capped = CoupletParams(fold_jump_ms=0.0, max_area_km2=biggest * 0.5)
+    remaining = detect_couplets(vol, [], capped)
+    assert all(c.area_km2 <= biggest * 0.5 for c in remaining)
+    assert len(remaining) < len(got) or remaining == []
+
+
+def test_real_vortex_survives_the_guards():
+    """The guards must not eat a genuine couplet: a 25 m/s Rankine spreads its
+    ΔV over the couplet diameter (~6 m/s per km), far under the fold jump."""
+    vol = _vortex_volume(10000.0, 40000.0)
+    couplets = detect_couplets(vol, [], CoupletParams())
+    assert len(couplets) == 1 and couplets[0].cyclonic
+
+
 def test_deterministic_ordering_and_ids():
     vol = _vortex_volume(10000.0, 40000.0)
     # Add a second, weaker vortex well away from the first (still above the

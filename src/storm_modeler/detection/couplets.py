@@ -60,6 +60,12 @@ _MIN_RANGE_KM = 5.0
 #: extrema — the couplet's inbound/outbound peaks straddle the shear maximum.
 _EXTREMA_DILATE_CELLS = 2
 
+#: The marker anchors on the |shear|-weighted centroid of the component's
+#: strong core — pixels at/above this fraction of the component's peak
+#: |shear| — so a merged or elongated component still points at the tightest
+#: rotation instead of the blob's geometric middle.
+_ANCHOR_FRACTION = 0.7
+
 
 @dataclass
 class Couplet:
@@ -166,17 +172,43 @@ def detect_couplets(
     xx, yy = np.meshgrid(volume.x, volume.y)
     px_area = volume.dx_km * volume.dx_km
 
+    # Aliasing-fold guard: raw NEXRAD velocity folds at ±Nyquist, and a fold
+    # boundary is a fake ~2·Vn discontinuity — the strongest "shear" in a
+    # folded volume. Mark every pixel beside an implausible adjacent-cell
+    # jump; components touching one are artifacts, not rotation. (Dealiased
+    # volumes have no such jumps; the guard is then a no-op.)
+    fold_px = None
+    if params.fold_jump_ms > 0:
+        fold_px = np.zeros(v.shape, dtype=bool)
+        with np.errstate(invalid="ignore"):
+            jump_x = np.abs(np.diff(v, axis=1)) >= params.fold_jump_ms
+            jump_y = np.abs(np.diff(v, axis=0)) >= params.fold_jump_ms
+        fold_px[:, :-1] |= jump_x
+        fold_px[:, 1:] |= jump_x
+        fold_px[:-1, :] |= jump_y
+        fold_px[1:, :] |= jump_y
+
     out: list[Couplet] = []
+    rejected_area = rejected_fold = 0
     for lab in range(1, n + 1):
         region = labels == lab
         area_km2 = float(region.sum()) * px_area
         if area_km2 < params.min_area_km2:
             continue
+        if area_km2 > params.max_area_km2:
+            rejected_area += 1
+            continue
+        if fold_px is not None and fold_px[region].any():
+            rejected_fold += 1
+            continue
 
-        w = np.abs(shear[region])
-        x_c = float(np.average(xx[region], weights=w))
-        y_c = float(np.average(yy[region], weights=w))
-        max_shear = float(w.max())
+        # Anchor on the strong core (see _ANCHOR_FRACTION), not the whole blob.
+        w_all = np.abs(shear[region])
+        max_shear = float(w_all.max())
+        core = region & (np.abs(np.nan_to_num(shear)) >= _ANCHOR_FRACTION * max_shear)
+        w = np.abs(shear[core])
+        x_c = float(np.average(xx[core], weights=w))
+        y_c = float(np.average(yy[core], weights=w))
         # CCW t̂ makes cyclonic rotation negative shear (see module docstring).
         cyclonic = float(np.mean(shear[region])) < 0.0
 
@@ -219,7 +251,9 @@ def detect_couplets(
                             c.centroid_lon, c.centroid_lat))
     for i, c in enumerate(out):
         c.couplet_id = i + 1
-    if out:
+    if out or rejected_fold or rejected_area:
         log.info("couplets.detected", valid_time=volume.valid_time.isoformat(),
-                 n=len(out), strongest_vr_sr=round(out[0].vr_sr_ms, 1))
+                 n=len(out),
+                 strongest_vr_sr=round(out[0].vr_sr_ms, 1) if out else None,
+                 rejected_fold=rejected_fold, rejected_area=rejected_area)
     return out

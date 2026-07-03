@@ -96,8 +96,10 @@ class CoupletParams:
 
     min_shear_s1: float = 0.004
     min_area_km2: float = 4.0
+    max_area_km2: float = 100.0
     max_range_km: float = 150.0
     assoc_max_km: float = 10.0
+    fold_jump_ms: float = 40.0  # 0 disables the aliasing-fold guard
 
     @property
     def settings_hash(self) -> str:
