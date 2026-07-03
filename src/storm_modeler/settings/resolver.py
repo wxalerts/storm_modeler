@@ -80,6 +80,27 @@ class CloudTopParams:
 
 
 @dataclass(frozen=True)
+class CoupletParams:
+    """The rotation-couplet knob set. Passed to ``couplets.detect_couplets``.
+
+    Registry keys (``couplet_*``) are wired via :meth:`from_dict`; the marker
+    display threshold (``couplet_marker_min_vrot_kt``) is a display knob, not
+    a detection knob, so it stays out of this set.
+    """
+
+    min_shear_s1: float = 0.004
+    min_area_km2: float = 4.0
+    max_range_km: float = 150.0
+    assoc_max_km: float = 10.0
+
+    @property
+    def settings_hash(self) -> str:
+        """Stable short digest of the knob set (provenance)."""
+        payload = json.dumps(asdict(self), sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
 class VaultParams:
     """The vault (HRRR freezing-level) knob set. Passed to ``vault.detect_vault``.
 
