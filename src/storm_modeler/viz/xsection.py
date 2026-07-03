@@ -22,6 +22,7 @@ from ..detection.detection_v2 import StormCell
 from ..models import GriddedVolume
 from ..settings.resolver import ViewerParams
 from . import scene_builder as sb
+from .motion import track_segment
 
 log = structlog.get_logger(__name__)
 
@@ -49,18 +50,6 @@ class Section:
 # Azimuth
 # ---------------------------------------------------------------------------
 
-def _track_seeds(cell: StormCell, results) -> list[tuple]:
-    """Ordered (valid_time, seed_x, seed_y) for ``cell``'s track across volumes."""
-    tid = cell.track_id
-    pts: list[tuple] = []
-    for res in results:
-        for c in res.cells:
-            if tid >= 0 and c.track_id == tid:
-                pts.append((c.valid_time, c.seed_x, c.seed_y))
-    pts.sort(key=lambda p: p[0])
-    return pts
-
-
 def section_azimuth(
     cell: StormCell, results, viewer: ViewerParams, manual_deg: float | None = None
 ) -> float:
@@ -71,15 +60,12 @@ def section_azimuth(
     if source == "fixed":
         return float(viewer.xsection_fixed_bearing) % 360.0
     if source == "track":
-        pts = _track_seeds(cell, results)
-        # Heading from the segment bracketing this cell's time.
-        idx = next((i for i, p in enumerate(pts) if p[0] == cell.valid_time), -1)
-        for a, b in ((idx, idx + 1), (idx - 1, idx)):
-            if 0 <= a < len(pts) and 0 <= b < len(pts) and a != b:
-                dx = pts[b][1] - pts[a][1]  # east
-                dy = pts[b][2] - pts[a][2]  # north
-                if math.hypot(dx, dy) > 1.0:  # > 1 m of motion
-                    return math.degrees(math.atan2(dx, dy)) % 360.0
+        # Heading from the track segment bracketing this cell's time (the
+        # same walk the SRM motion vector uses — see viz.motion).
+        seg = track_segment(cell, results)
+        if seg is not None:
+            dx, dy, _dt = seg
+            return math.degrees(math.atan2(dx, dy)) % 360.0
     # Fall back to the fixed bearing (default north) when motion is unknown.
     return float(viewer.xsection_fixed_bearing) % 360.0
 

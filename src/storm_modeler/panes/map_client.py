@@ -105,16 +105,34 @@ class MapClient:
         self._framed_id: str | None = None
         self._product = "reflectivity"
         self._last_volume: GriddedVolume | None = None
+        # Storm motion (u, v m/s east/north) framing the SRM product. (0, 0)
+        # until the app derives one — SRM then degrades to base velocity.
+        self._storm_motion: tuple[float, float] = (0.0, 0.0)
         self._launch()
 
     # --- product selection ------------------------------------------------
 
     def set_product(self, product: str) -> None:
         """Switch the radar layer to another moment and re-render the current
-        volume (reflectivity, velocity, spectrum_width, …)."""
+        volume (reflectivity, velocity, storm_relative_velocity, …)."""
         self._product = product
         if self._last_volume is not None:
             self.set_radar(self._last_volume)
+
+    def set_storm_motion(self, u_ms: float, v_ms: float) -> None:
+        """Set the storm-motion frame for SRM; re-render if SRM is showing.
+
+        Sub-0.1 m/s changes only update the stored vector (matching the layer
+        cache tolerance) — scrub frames re-render through set_radar anyway.
+        """
+        prev = self._storm_motion
+        self._storm_motion = (float(u_ms), float(v_ms))
+        if (
+            self._product == "storm_relative_velocity"
+            and self._last_volume is not None
+            and (abs(prev[0] - u_ms) > 0.1 or abs(prev[1] - v_ms) > 0.1)
+        ):
+            self.set_radar(self._last_volume)  # set_radar re-derives the layer
 
     # --- process management ----------------------------------------------
 
@@ -212,11 +230,24 @@ class MapClient:
 
     def set_radar(self, volume: GriddedVolume) -> None:
         self._last_volume = volume
+        # SRM is derived, not gridded: (re)compute this volume's layer from the
+        # current storm motion before the missing-product check, so scrubbing
+        # onto a new volume keeps the frame. No-op cache hit if unchanged.
+        if self._product == "storm_relative_velocity":
+            radar_render.ensure_srm_layer(volume, *self._storm_motion)
         # If the selected product wasn't gridded into this (older) volume, say so
         # rather than silently showing reflectivity.
         if self._product != "reflectivity" and volume.product_2d(self._product) is None:
             label = (f"{_product_label('reflectivity')}   "
                      f"({self._product} not in this volume — re-download)")
+        elif self._product == "storm_relative_velocity":
+            # SRM without its frame displayed is a data-integrity hazard: the
+            # moment label always carries the motion vector (NWS convention,
+            # direction the storm moves FROM).
+            from ..viz.motion import speed_dir_from_uv
+
+            speed_kt, dir_deg = speed_dir_from_uv(*self._storm_motion)
+            label = f"SRM · {speed_kt:.0f} kt @ {dir_deg:03.0f}°"
         else:
             label = _product_label(self._product)
         rgba, (lat_min, lon_min, lat_max, lon_max) = radar_render.product_lonlat_image(

@@ -130,6 +130,9 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             # HRRR freezing-level grids for the selected warning (vault/OT
             # detection re-runs against them whenever a volume or grid lands).
             self._hrrr_grids: list = []
+            # Last (cell, cells) the SRM motion frame was resolved from, so a
+            # settings reload can re-resolve without a fresh selection.
+            self._srm_context: tuple = (None, None)
             # On-disk cache of downloaded warnings (volumes + metadata) so the
             # "Downloaded" list and its data survive app restarts.
             self.downloads = DownloadStore()
@@ -344,6 +347,9 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
                 f"Settings reloaded (detection hash {self.params.settings_hash})"
             )
             self._reprocess_current()
+            # SRM motion source / manual vector may have changed — re-resolve
+            # from the last selection context and re-push to the map.
+            self._update_srm_motion(*self._srm_context)
 
         def _reprocess_current(self) -> None:
             """Re-run SCIT detection + tracking on the selected warning, in memory.
@@ -618,6 +624,11 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             log.info("gui.storm_selected", cell_id=c.cell_id, track_id=c.track_id,
                      max_dbz=round(c.max_dbz, 1), valid_time=c.valid_time.isoformat(),
                      n_volumes=len(results))
+            # Frame SRM on this storm's track motion (fallbacks inside).
+            volume_cells = next(
+                (r.cells for r in results if r.volume.valid_time == c.valid_time), []
+            )
+            self._update_srm_motion(c, volume_cells)
             self.model.show_cell(c, results, source_factory=factory)
             self.statusBar().showMessage(
                 f"Storm id {c.cell_id}  track {c.track_id}  "
@@ -640,12 +651,54 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
 
         def _on_track_selected(self, track) -> None:
             """A track was clicked in the Storm Track window — draw it on the map."""
-            if track is not None:
-                self.map.show_storm_track(track)
+            if track is None:
+                return
+            self.map.show_storm_track(track)
+            # Frame SRM on the selected track: use its latest cell as the
+            # motion anchor (the segment walk needs a StormCell + results).
+            results = self._results.get(self._selected_id, [])
+            anchor = None
+            for res in sorted(results, key=lambda r: r.volume.valid_time):
+                for c in res.cells:
+                    if track.track_id >= 0 and c.track_id == track.track_id:
+                        anchor = (c, res.cells)
+            if anchor is not None:
+                self._update_srm_motion(*anchor)
+
+        def _update_srm_motion(self, cell=None, cells=None) -> None:
+            """Resolve the SRM motion frame per settings and push it to the map.
+
+            Runs on storm/track selection and on every scrub frame, so the
+            frame follows the track segment under the displayed volume.
+            Resolution order (``srm_motion_source``): manual vector →
+            selected track segment → mean motion of the tracks alive in the
+            current volume → (0, 0), where SRM degrades to base velocity; any
+            drop down the chain logs ``srm.motion_fallback``.
+            """
+            from .viz import motion
+
+            self._srm_context = (cell, cells)
+            results = self._results.get(self._selected_id, [])
+            source = str(self.settings.get("srm_motion_source", "selected_track"))
+            manual_uv = None
+            if source == "manual":
+                manual_uv = motion.uv_from_speed_dir(
+                    float(self.settings.get("srm_manual_speed_kt", 30.0)),
+                    float(self.settings.get("srm_manual_dir_deg", 240.0)),
+                )
+            (u, v), used = motion.resolve_motion(source, cell, cells, results,
+                                                 manual_uv)
+            if used != source:
+                log.warning("srm.motion_fallback", requested=source, used=used,
+                            u_ms=round(u, 2), v_ms=round(v, 2))
+            self.map.set_storm_motion(u, v)
 
         def _on_model_frame(self, volume, cell, cells) -> None:
             """3D pane produced a frame (selection or playback) — sync the map."""
             if getattr(self, "_map_warning", None) is not None:
+                # Re-derive the SRM frame from this frame's track segment
+                # BEFORE the map re-renders, so the frame follows the track.
+                self._update_srm_motion(cell, cells)
                 self.map.show_cell_selection(self._map_warning, volume, cells, cell)
                 self._show_lightning_for(volume)
                 self._show_satellite_for(volume)

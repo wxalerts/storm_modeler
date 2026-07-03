@@ -122,6 +122,20 @@ REGISTRY: tuple[SettingSpec, ...] = (
                 "Toggle the states basemap layer."),
     SettingSpec("show_highways", "Show highways", GROUP_DISPLAY, "bool", True,
                 "Toggle the highways basemap layer."),
+    SettingSpec("srm_motion_source", "SRM motion source", GROUP_DISPLAY, "choice",
+                "selected_track", "Storm motion framing the SRM map product: "
+                "the selected storm's track segment, the mean of all tracks "
+                "alive in the volume, or the manual vector below. Display "
+                "knob only — detection always runs on base velocity.",
+                choices=("selected_track", "mean_tracks", "manual")),
+    SettingSpec("srm_manual_speed_kt", "SRM manual speed (kt)", GROUP_DISPLAY,
+                "float", 30.0, "Manual storm-motion speed used when the SRM "
+                "motion source is 'manual'.", min=0.0, max=120.0),
+    SettingSpec("srm_manual_dir_deg", "SRM manual direction (deg)", GROUP_DISPLAY,
+                "float", 240.0, "Manual storm-motion direction (meteorological: "
+                "the bearing the storm moves FROM; 240 = out of the southwest) "
+                "used when the SRM motion source is 'manual'.",
+                min=0.0, max=360.0),
     # -- Viewer (3D model pane, Phase B) -----------------------------------
     SettingSpec("vol_floor_dbz", "Volume floor (dBZ)", GROUP_VIEWER, "float",
                 20.0, "Reflectivity below this is fully transparent in the 3D "
