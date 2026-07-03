@@ -53,6 +53,9 @@ class VolumeResult:
     index: int = 0
     total: int = 0
     settings_hash: str = ""
+    # Rotation couplets detected in the volume's velocity layer (addon
+    # annotation, filled by the app after SCIT; empty when not computed).
+    couplets: list = field(default_factory=list)
 
 
 @dataclass

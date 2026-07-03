@@ -356,6 +356,51 @@ class MapClient:
     def clear_stormtrack(self) -> None:
         self._send({"cmd": "stormtrack_clear"})
 
+    # --- rotation couplets --------------------------------------------------
+
+    def set_couplets(self, couplets, min_vrot_kt: float = 15.0) -> None:
+        """Layer velocity couplets as inverted-triangle rotation markers.
+
+        Follows the cloud-top GeoJSON pattern: one point feature per couplet
+        with numeric properties, popup text built map-side. Couplets whose
+        storm-relative Vrot falls below ``min_vrot_kt`` are not sent at all;
+        the rest carry a strength ``band`` (weak < 26 kt / moderate 26–40 /
+        strong > 40) that drives the marker styling.
+        """
+        kt = 1.94384
+        feats = []
+        for c in couplets or []:
+            vr_kt = c.vr_sr_ms * kt
+            if vr_kt < min_vrot_kt:
+                continue
+            band = "weak" if vr_kt < 26.0 else ("moderate" if vr_kt <= 40.0
+                                                else "strong")
+            feats.append({
+                "type": "Feature",
+                "properties": {
+                    "band": band,
+                    "cyclonic": bool(c.cyclonic),
+                    "vr_sr_kt": round(vr_kt, 1),
+                    "vr_kt": round(c.vr_ms * kt, 1),
+                    "dv_kt": round((c.v_max_ms - c.v_min_ms) * kt, 1),
+                    "shear_s1": round(c.max_shear_s1, 5),
+                    "motion_source": c.motion_source,
+                    "range_km": round(c.range_km, 1),
+                    "area_km2": round(c.area_km2, 1),
+                },
+                "geometry": {"type": "Point",
+                             "coordinates": [c.centroid_lon, c.centroid_lat]},
+            })
+        self._send({"cmd": "couplets",
+                    "geojson": {"type": "FeatureCollection", "features": feats}})
+
+    def clear_couplets(self) -> None:
+        self._send({"cmd": "couplets_clear"})
+
+    def pan_to(self, lat: float, lon: float) -> None:
+        """Recenter without changing zoom (the map's plain pan command)."""
+        self._send({"cmd": "pan", "lat": float(lat), "lon": float(lon)})
+
     def highlight_cell(self, cell: StormCell) -> None:
         # Recenter only — keep the user's current zoom while stepping volumes.
         self._send({"cmd": "highlight", "geojson": mapping(cell.envelope)})

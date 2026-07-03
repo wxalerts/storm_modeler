@@ -203,6 +203,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             # _on_storm builds the 3D scene; the 3D pane then emits frame_ready
             # for each frame (incl. playback), which drives the map in lock-step.
             self.volumes.storm_selected.connect(self._on_storm)
+            self.volumes.couplet_selected.connect(self._on_couplet_selected)
             self.model.frame_ready.connect(self._on_model_frame)
             self.lightning_window.fetch_requested.connect(self.on_fetch_lightning)
             self.lightning_window.clear_requested.connect(self.map.clear_lightning)
@@ -388,6 +389,10 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             # Fresh cells lost their vault annotation — re-derive it from the
             # already-fetched freezing-level grids (no-op without any).
             annotate_vault_results(rebuilt, self._hrrr_grids, self.settings.vault)
+            # Couplets follow the cells' lifecycle: recompute per volume with
+            # the full rebuilt history (track motion needs it).
+            for res in rebuilt:
+                self._annotate_couplets(res, rebuilt)
             self._results[wid] = rebuilt
 
             # Refresh the detection-driven views; leave lightning/satellite
@@ -395,6 +400,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             self.volumes.show_results(rebuilt)
             last = rebuilt[-1]
             self.map.show_result(last.warning, last.volume, last.cells)
+            self.map.set_couplets(last.couplets, self._couplet_marker_min_kt())
             self._refresh_tracks()
             self.statusBar().showMessage(
                 f"Reprocessed {last.warning.event} — {len(rebuilt)} volume(s) "
@@ -455,6 +461,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             self._reset_hrrr()
             self.stormtrack_window.set_warning(warning)
             self.map.clear_stormtrack()
+            self.map.clear_couplets()
             for res in self._results.get(warning.id, []):
                 self.volumes.add_result(res)
             self._refresh_tracks()
@@ -495,6 +502,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             self._reset_hrrr()
             self.stormtrack_window.set_warning(warning)
             self.map.clear_stormtrack()
+            self.map.clear_couplets()
 
             log.info("download.start", warning=warning.id, event_name=warning.event,
                      site=site.icao, issued=warning.issued.isoformat(),
@@ -587,6 +595,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             # Vault/OT annotation, if the freezing level is already in (no-op
             # otherwise — a later HRRR fetch re-annotates every volume).
             annotate_vault_results([res], self._hrrr_grids, self.settings.vault)
+            self._annotate_couplets(res, self._results.get(warning.id, []) + [res])
             if getattr(self, "_dl_persistence", None) is not None:
                 try:
                     self._dl_persistence.upsert_cells(
@@ -605,6 +614,7 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             if res.warning.id == self._selected_id:
                 self.volumes.add_result(res)
                 self.map.show_result(res.warning, res.volume, res.cells)
+                self.map.set_couplets(res.couplets, self._couplet_marker_min_kt())
                 self._show_lightning_for(res.volume)
                 self._show_satellite_for(res.volume)
                 self._show_hrrr_for(res.volume)
@@ -633,6 +643,46 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
             self.statusBar().showMessage(
                 f"Storm id {c.cell_id}  track {c.track_id}  "
                 f"{c.max_dbz:.1f} dBZ  depth {c.depth_km:.1f} km"
+            )
+
+        # --- rotation couplets ---------------------------------------------
+
+        def _couplet_params(self):
+            """The rotation-detection knob set (registry-backed defaults)."""
+            from .settings.resolver import CoupletParams
+            # NOTE: switches to the resolved settings projection once the
+            # rotation settings group lands (next phase); defaults match it.
+            return CoupletParams()
+
+        def _couplet_marker_min_kt(self) -> float:
+            return float(self.settings.get("couplet_marker_min_vrot_kt", 15.0))
+
+        def _annotate_couplets(self, res, results) -> None:
+            """Detect this volume's velocity couplets (never fatal to the run).
+
+            Rides the same lifecycle as SCIT cells: per fresh volume in
+            ``_on_gridded`` and per rebuilt volume in ``_reprocess_current``.
+            ``results`` is the track history the motion association reads.
+            """
+            from .detection.couplets import detect_couplets
+
+            try:
+                res.couplets = detect_couplets(
+                    res.volume, res.cells, self._couplet_params(),
+                    results=results,
+                )
+            except Exception as e:  # noqa: BLE001 - annotation must not break a run
+                log.error("gui.couplet_error", warning=res.warning.id,
+                          error=str(e))
+                res.couplets = []
+
+        def _on_couplet_selected(self, cp) -> None:
+            """A couplet row was clicked in the Data pane — pan to its marker."""
+            self.map.pan_to(cp.centroid_lat, cp.centroid_lon)
+            self.statusBar().showMessage(
+                f"{'Cyclonic' if cp.cyclonic else 'Anticyclonic'} rotation  "
+                f"Vrot {cp.vr_sr_ms * 1.94384:.0f} kt SR  "
+                f"r {cp.range_km:.0f} km @ {cp.center_az_deg:03.0f}°"
             )
 
         # --- storm tracks -------------------------------------------------
@@ -700,6 +750,13 @@ def _build_window(persist: bool, *, use_local_settings: bool = True):
                 # BEFORE the map re-renders, so the frame follows the track.
                 self._update_srm_motion(cell, cells)
                 self.map.show_cell_selection(self._map_warning, volume, cells, cell)
+                # Keep the rotation markers in step with the displayed volume.
+                res = next(
+                    (r for r in self._results.get(self._selected_id, [])
+                     if r.volume.valid_time == volume.valid_time), None,
+                )
+                self.map.set_couplets(res.couplets if res else [],
+                                      self._couplet_marker_min_kt())
                 self._show_lightning_for(volume)
                 self._show_satellite_for(volume)
                 self._show_hrrr_for(volume)

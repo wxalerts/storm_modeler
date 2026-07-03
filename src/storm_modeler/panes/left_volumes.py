@@ -19,6 +19,7 @@ from ..detection.detection_v2 import StormCell
 from ..pipeline import VolumeResult
 
 CELL_ROLE = Qt.UserRole + 1
+COUPLET_ROLE = Qt.UserRole + 2
 
 
 def _z(dt: datetime) -> str:
@@ -43,8 +44,18 @@ def _cell_label(c: StormCell) -> str:
     return "  ".join(parts)
 
 
+def _couplet_label(cp) -> str:
+    """One-line rotation summary, e.g. ``Vrot 32 kt SR · cyclonic · r 58 km``."""
+    return (
+        f"Vrot {cp.vr_sr_ms * 1.94384:.0f} kt SR"
+        f" · {'cyclonic' if cp.cyclonic else 'anticyc'}"
+        f" · r {cp.range_km:.0f} km"
+    )
+
+
 class LeftVolumesPane(QWidget):
     storm_selected = Signal(object)  # StormCell
+    couplet_selected = Signal(object)  # detection.couplets.Couplet
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -94,6 +105,11 @@ class LeftVolumesPane(QWidget):
             leaf.setEditable(False)
             leaf.setData(c, CELL_ROLE)
             vol.appendRow(leaf)
+        for cp in getattr(res, "couplets", []) or []:
+            leaf = QStandardItem(f"Couplet  [{_couplet_label(cp)}]")
+            leaf.setEditable(False)
+            leaf.setData(cp, COUPLET_ROLE)
+            vol.appendRow(leaf)
         self.tree.expandAll()
 
     def show_results(self, results: list[VolumeResult]) -> None:
@@ -105,3 +121,7 @@ class LeftVolumesPane(QWidget):
         cell = self.model.data(index, CELL_ROLE)
         if isinstance(cell, StormCell):
             self.storm_selected.emit(cell)
+            return
+        couplet = self.model.data(index, COUPLET_ROLE)
+        if couplet is not None:
+            self.couplet_selected.emit(couplet)

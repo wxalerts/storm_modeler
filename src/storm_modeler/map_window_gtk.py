@@ -60,7 +60,7 @@ L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/
 L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
             {maxZoom:18}).addTo(map);
 var radarLayer=null, warningLayer=null, cellsLayer=null, hiLayer=null, lightningLayer=null;
-var satLayer=null, cloudtopLayer=null, trackLayer=null;
+var satLayer=null, cloudtopLayer=null, trackLayer=null, coupletsLayer=null;
 // Canvas renderer: thousands of flash markers paint far faster than SVG.
 var lightningCanvas = L.canvas({padding:0.5});
 function setRadar(url, b){ if(radarLayer)map.removeLayer(radarLayer);
@@ -116,13 +116,37 @@ function setStormTrack(gj){ if(trackLayer)map.removeLayer(trackLayer);
   }).addTo(map);}
 function clearStormTrack(){ if(trackLayer)map.removeLayer(trackLayer);
   trackLayer=null;}
+// Rotation couplets: inverted-triangle markers (fixed-size SVG divIcons — a
+// handful per volume, so no canvas machinery needed). Hollow outline = weak,
+// filled = moderate, filled + larger = strong. Red family = cyclonic, cyan =
+// anticyclonic. These are rotation evidence markers only.
+function coupletIcon(p){
+  var s=p.band==='strong'?24:16;
+  var col=p.cyclonic?'#ff4040':'#35d0ff';
+  var fill=p.band==='weak'?'none':col;
+  var svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+s+'" height="'+s+
+    '" viewBox="0 0 20 20"><polygon points="2.5,3.5 17.5,3.5 10,17.5" fill="'+
+    fill+'" stroke="'+col+'" stroke-width="2.5" stroke-linejoin="round"/></svg>';
+  return L.divIcon({html:svg,className:'',iconSize:[s,s],iconAnchor:[s/2,s*0.8]});
+}
+function setCouplets(gj){ if(coupletsLayer)map.removeLayer(coupletsLayer);
+  coupletsLayer=L.geoJSON(gj,{
+    pointToLayer:function(f,ll){return L.marker(ll,{icon:coupletIcon(f.properties)});},
+    onEachFeature:function(f,l){var p=f.properties;
+      var s='<b>'+(p.cyclonic?'CYCLONIC':'ANTICYCLONIC')+' ROTATION</b><br>'+
+        'Vrot '+p.vr_sr_kt.toFixed(0)+' kt (SR) · ΔV '+p.dv_kt.toFixed(0)+
+        ' kt · shear '+p.shear_s1.toFixed(4)+' s⁻¹ · '+p.motion_source;
+      l.bindPopup(s);}
+  }).addTo(map);}
+function clearCouplets(){ if(coupletsLayer)map.removeLayer(coupletsLayer);
+  coupletsLayer=null;}
 function fitBounds(b){ map.fitBounds(b,{padding:[25,25], animate:false}); }
 function panTo(lat, lon){ map.panTo([lat,lon],{animate:false}); }
 function setProduct(p){ document.getElementById('prod').textContent = p; }
 function clearAll(){ [radarLayer,warningLayer,cellsLayer,hiLayer,lightningLayer,
-  satLayer,cloudtopLayer,trackLayer].forEach(function(l){if(l)map.removeLayer(l);});
+  satLayer,cloudtopLayer,trackLayer,coupletsLayer].forEach(function(l){if(l)map.removeLayer(l);});
   radarLayer=warningLayer=cellsLayer=hiLayer=lightningLayer=null;
-  satLayer=cloudtopLayer=trackLayer=null;}
+  satLayer=cloudtopLayer=trackLayer=coupletsLayer=null;}
 </script></body></html>"""
 
 
@@ -216,6 +240,10 @@ class MapApp:
             self._js(f"setStormTrack({json.dumps(msg['geojson'])});")
         elif cmd == "stormtrack_clear":
             self._js("clearStormTrack();")
+        elif cmd == "couplets":
+            self._js(f"setCouplets({json.dumps(msg['geojson'])});")
+        elif cmd == "couplets_clear":
+            self._js("clearCouplets();")
         elif cmd == "fit":
             self._js(f"fitBounds({json.dumps(msg['bounds'])});")
         elif cmd == "pan":
